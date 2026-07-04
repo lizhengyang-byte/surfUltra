@@ -30,22 +30,24 @@
 
 ### 特征化方案
 
-| 方式 | 维度 | 对应脚本 |
+| 方式 | 维度 | 对应模块 |
 |---|---|---|
 | **RDKit 精选描述符** | ~62 | `smiles_to_features.py` — 分子量、LogP、TPSA、电荷、拓扑、VSA 分布等 |
+| **Morgan 圆形指纹 (ECFP4)** | 2048 | `001.py` / `002.py` 内置 `scikit-mol` 转换器 |
 | **AttentiveFP 分子图** | 原子 39 维 + 键 11 维 | `train_gnn.py` 内置 `smiles_to_graph()` |
 
 ### 模型一览
 
-| 脚本 | 模型 | 框架 | 超参数搜索 |
-|---|---|---|---|
-| `train_xgboost.py` | XGBoost | xgboost | Optuna 60 trials |
-| `train_LightGBM.py` | LightGBM | lightgbm | Optuna 60 trials |
-| `train_SVR.py` | SVR (RBF/Poly/Sigmoid) | scikit-learn | Optuna 60 trials |
-| `train_rnn.py` | MLP (Dense+BN+Dropout) | TensorFlow/Keras | Optuna 30 trials |
-| `train_mlp.py` | MLP (PyTorch) | PyTorch | Optuna 30 trials |
-| `train_gnn.py` | **AttentiveFP** (GNN) | PyTorch Geometric | Optuna 30 trials |
-| `001.py` | Morgan 指纹 + Ridge | scikit-mol | — |
+| 脚本 | 特征 | 模型 | 框架 | 超参数搜索 |
+| --- | --- | --- | --- | --- |
+| `train_xgboost.py` | RDKit 描述符 (~62) | XGBoost | xgboost | Optuna 60 trials |
+| `train_LightGBM.py` | RDKit 描述符 (~62) | LightGBM | lightgbm | Optuna 60 trials |
+| `train_SVR.py` | RDKit 描述符 (~62) | SVR (RBF/Poly/Sigmoid) | scikit-learn | Optuna 60 trials |
+| `train_rnn.py` | RDKit 描述符 (~62) | MLP (Dense+BN+Dropout) | TensorFlow/Keras | Optuna 30 trials |
+| `train_mlp.py` | RDKit 描述符 (~62) | MLP (PyTorch) | PyTorch | Optuna 30 trials |
+| `train_gnn.py` | 分子图 (原子 39+键 11) | **AttentiveFP** (GNN) | PyTorch Geometric | Optuna 30 trials |
+| `001.py` | Morgan 指纹 (2048) | Ridge（快速基线） | scikit-mol | — |
+| `002.py` | Morgan 指纹 (2048) | 多模型基准 (Ridge, RF, GBR, SVR, KNN, XGB, LGB) | scikit-mol + sklearn | — |
 
 ### 当前最佳结果（pCMC）
 
@@ -78,11 +80,21 @@ python train_mlp.py
 ## 项目结构
 
 ```
-├── data/                    # CSV 数据文件
-├── reports/                 # 预测图 + 日志
-├── smiles_to_features.py    # 精选描述符提取
-├── train_*.py               # 各模型独立训练脚本
-└── 001.py / 002.py          # 快速探索脚本
+├── data/                       # CSV 数据文件
+│   ├── surfpro_train.csv       # 训练集 (1335)
+│   ├── surfpro_test.csv        # 测试集 (140)
+│   ├── surfpro_literature.csv  # 文献数据 (1503)
+│   └── surfpro_imputed.csv     # 插补后完整数据 (1476)
+├── reports/                    # 预测图 + 日志
+├── smiles_to_features.py       # RDKit 精选描述符提取 (~62 维)
+├── train_xgboost.py            # XGBoost + Optuna
+├── train_LightGBM.py           # LightGBM + Optuna
+├── train_SVR.py                # SVR + Optuna
+├── train_rnn.py                # Keras MLP + Optuna
+├── train_mlp.py                # PyTorch MLP + Optuna
+├── train_gnn.py                # AttentiveFP GNN + Optuna
+├── 001.py                      # Morgan 指纹 + Ridge 快速基线
+└── 002.py                      # Morgan 指纹多模型 benchmark
 ```
 
 > **注意：** 没有单元测试，各脚本独立运行（无共享模块），图数据在 `train_gnn.py` 中即时转换、无预存 `.pt` 文件。
