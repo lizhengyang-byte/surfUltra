@@ -29,13 +29,17 @@ def smiles_to_features(smiles: str) -> np.ndarray:
     for _, func in _ALL_DESCRIPTORS:
         try:
             val = func(mol)
-            if val is None:
+            if val is None or not np.isfinite(val):
                 val = 0.0
         except Exception:
             val = 0.0
         features.append(val)
 
-    return np.array(features)
+    arr = np.array(features, dtype=np.float64)
+    # 二次安全: 清除漏网的 inf/nan, 并裁剪极端大值 (XGBoost QuantileDMatrix 不接受)
+    np.nan_to_num(arr, copy=False)
+    np.clip(arr, -1e10, 1e10, out=arr)
+    return arr
 
 
 def get_descriptor_names() -> list:
@@ -52,15 +56,3 @@ if __name__ == "__main__":
     print(f"前 10 个值: {result[:10]}")
     if result.size > 0:
         print(f"有效特征，非零个数: {np.count_nonzero(result)}")
-    else:
-        print("无效的 SMILES 字符串")
-
-
-if __name__ == "__main__":
-    # 测试示例
-    test_smiles = "CC(C)(C)OCCCCCCCCCCCCOS(=O)(=O)[O-].[Na+]"
-    result = smiles_to_features(test_smiles)
-    if result.size > 0:
-        print(f"特征向量: {result}")
-    else:
-        print("无效的 SMILES 字符串")
