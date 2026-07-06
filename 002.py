@@ -11,7 +11,8 @@ import pandas as pd
 import numpy as np
 
 # ========== 加载数据 ==========
-df_train = pd.read_csv('data/surfpro_train.csv').dropna(subset=['pCMC'])
+# df_train = pd.read_csv('data/surfpro_train.csv').dropna(subset=['pCMC'])
+df_train = pd.read_csv('data/surfpro_imputed.csv').dropna(subset=['pCMC'])
 df_test  = pd.read_csv('data/surfpro_test.csv').dropna(subset=['pCMC'])
 
 y_train = df_train['pCMC'].values
