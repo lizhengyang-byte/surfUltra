@@ -33,6 +33,7 @@
 | 方式 | 维度 | 对应模块 |
 |---|---|---|
 | **RDKit 精选描述符** | ~62 | `smiles_to_features.py` — 分子量、LogP、TPSA、电荷、拓扑、VSA 分布等 |
+| **RDKit 全部描述符** | ~217 | `smiles_to_features_all.py` — RDKit 所有可用描述符 |
 | **Morgan 圆形指纹 (ECFP4)** | 2048 | `001.py` / `002.py` 内置 `scikit-mol` 转换器 |
 | **AttentiveFP 分子图** | 原子 39 维 + 键 11 维 | `train_gnn.py` 内置 `smiles_to_graph()` |
 
@@ -45,15 +46,22 @@
 | `train_SVR.py` | RDKit 描述符 (~62) | SVR (RBF/Poly/Sigmoid) | scikit-learn | Optuna 60 trials |
 | `train_rnn.py` | RDKit 描述符 (~62) | MLP (Dense+BN+Dropout) | TensorFlow/Keras | Optuna 30 trials |
 | `train_mlp.py` | RDKit 描述符 (~62) | MLP (PyTorch) | PyTorch | Optuna 30 trials |
+| `train_mlp_use_all_features.py` | RDKit 全部描述符 (~217) | MLP (PyTorch) | PyTorch | Optuna 30 trials |
+| `train_rnn_use_all_features.py` | RDKit 全部描述符 (~217) | LSTM (PyTorch) | PyTorch | Optuna 30 trials |
 | `train_gnn.py` | 分子图 (原子 39+键 11) | **AttentiveFP** (GNN) | PyTorch Geometric | Optuna 30 trials |
 | `001.py` | Morgan 指纹 (2048) | Ridge（快速基线） | scikit-mol | — |
 | `002.py` | Morgan 指纹 (2048) | 多模型基准 (Ridge, RF, GBR, SVR, KNN, XGB, LGB) | scikit-mol + sklearn | — |
 
 ### 当前最佳结果（pCMC）
 
-| 模型 | Test R² | 来源 |
-|---|---|---|
-| MLP (PyTorch) | **0.8399** | `train_mlp.py` |
+| 模型 | 特征 | Test R² | 来源 |
+|------|------|---------|------|
+| **MLP (PyTorch)** | 全部 RDKit 描述符 (~217) | **0.8650** | `train_mlp_use_all_features.py` |
+| **LSTM (PyTorch)** | 全部 RDKit 描述符 (~217) | *待运行* | `train_rnn_use_all_features.py` |
+| MLP (PyTorch) | RDKit 精选描述符 (~62) | 0.8399 | `train_mlp.py` |
+| MLP (Keras) | RDKit 精选描述符 (~62) | 0.8399 | `train_rnn.py` |
+| XGBoost | RDKit 精选描述符 (~62) | 0.8401 (Val) | `train_xgboost.py` |
+| SVR (RBF) | Morgan 指纹 (2048) | 0.6227 | `002.py` |
 
 ## 快速开始
 
@@ -87,11 +95,14 @@ python train_mlp.py
 │   └── surfpro_imputed.csv     # 插补后完整数据 (1476)
 ├── reports/                    # 预测图 + 日志
 ├── smiles_to_features.py       # RDKit 精选描述符提取 (~62 维)
+├── smiles_to_features_all.py   # RDKit 全部描述符提取 (~217 维)
 ├── train_xgboost.py            # XGBoost + Optuna
 ├── train_LightGBM.py           # LightGBM + Optuna
 ├── train_SVR.py                # SVR + Optuna
-├── train_rnn.py                # Keras MLP + Optuna
-├── train_mlp.py                # PyTorch MLP + Optuna
+├── train_rnn.py                # Keras MLP (62维) + Optuna
+├── train_mlp.py                # PyTorch MLP (62维) + Optuna
+├── train_mlp_use_all_features.py  # PyTorch MLP (217维全描述符) + Optuna
+├── train_rnn_use_all_features.py  # PyTorch LSTM (217维全描述符) + Optuna
 ├── train_gnn.py                # AttentiveFP GNN + Optuna
 ├── 001.py                      # Morgan 指纹 + Ridge 快速基线
 └── 002.py                      # Morgan 指纹多模型 benchmark
