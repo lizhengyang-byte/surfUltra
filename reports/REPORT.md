@@ -2,7 +2,7 @@
 
 > **目标变量:** pCMC（临界胶束浓度对数值）  
 > **数据集:** 1335 条训练样本，1204 条有效（含 pCMC 标签）  
-> **特征:** 62 维精选 / 217 维全量 RDKit 分子描述符（XGBoost 经特征选择保留 109 维）  
+> **特征:** 62 维精选 / 217 维 RDKit 分子描述符 / 1415 维 RDKit+MACCS+ECFP4+Aux（XGBoost 经特征选择保留 109 维）  
 
 ---
 
@@ -12,7 +12,9 @@
 
 | 模型 | 框架 | RMSE ↓ | MAE ↓ | R² ↑ | 调优 Trial |
 |------|------|--------|-------|------|-----------|
+| **CatBoost (全描述符, Optuna)** | CatBoost | **0.3356** | **0.2221** | **0.9088** | 50 |
 | **LightGBM (全描述符, Optuna)** | LightGBM | **0.3525** | **0.2391** | **0.8994** | 50 |
+| **LightGBM (Advanced: RDKit+MACCS+ECFP4, Optuna)** | LightGBM | 0.3698 | 0.2459 | **0.8893** | 50 |
 | **MLP (全描述符)** | PyTorch | 0.4083 | 0.2525 | 0.8650 | 30 |
 | **LightGBM (全描述符, 手动)** | LightGBM | 0.4179 | 0.2742 | 0.8586 | 手动调参 |
 | **XGBoost (全描述符, 特征选择)** | XGBoost | 0.4053 | 0.2736 | **0.8670** | 100 |
@@ -25,7 +27,7 @@
 | **AttentiveFP (GNN)** | PyG | *待运行* | *待运行* | *待运行* | 30 |
 
 > **注:** 除 SVR 仅输出验证集指标外，其余模型均报告测试集结果。  
-> "MLP (全描述符)"、"LightGBM (全描述符)"、"XGBoost (全描述符, 特征选择)" 和 "RNN (PyTorch LSTM, 全描述符)" 使用全部 217 维 RDKit 描述符（XGBoost 进一步经特征选择保留 109 维）；其余模型基于 62 维精选描述符。
+> "MLP (全描述符)"、"LightGBM (全描述符)"、"XGBoost (全描述符, 特征选择)" 和 "RNN (PyTorch LSTM, 全描述符)" 使用全部 217 维 RDKit 描述符（XGBoost 进一步经特征选择保留 109 维）；"LightGBM (Advanced)" 使用 1415 维（RDKit 217 + MACCS 166 + ECFP4 1024 + Aux 7）；其余模型基于 62 维精选描述符。
 
 ### 1.2 详细分集指标
 
@@ -34,6 +36,10 @@
 | **LightGBM (全描述符, Optuna)** | Train (all) | 0.1563 | 0.1037 | 0.9792 |
 | | Test | **0.3525** | **0.2391** | **0.8994** |
 | | CV (5-fold) | — | — | 0.4042 ± 0.2155 |
+| **LightGBM (Advanced: RDKit+MACCS+ECFP4, Optuna)** | Train (all) | 0.1270 | 0.0877 | 0.9863 |
+| | Test (单一模型) | 0.3698 | 0.2459 | 0.8893 |
+| | CV Test (5-Fold 集成) | 0.3976 | 0.2744 | 0.8720 |
+| | CV R² (变换空间) | — | — | 0.3840 ± 0.2374 |
 | **XGBoost (全描述符, 特征选择)** | Train (all) | 0.2006 | 0.1473 | 0.9658 |
 | | Test | **0.4053** | **0.2736** | **0.8670** |
 | | CV (5-fold) | — | — | 0.4409 ± 0.1887 |
@@ -187,7 +193,70 @@
 - **CV R² (5-fold):** 0.3859 ± 0.2227（[0.503, -0.023, 0.323, 0.582, 0.544]）
 - **分析:** 使用 217 维全描述符后，手动调参即达测试 R²=0.8586，大幅超越此前 62 维版本（0.40 CV）。但在 Optuna 进一步优化后（R²=0.8994），手动调参版本已被大幅超越。
 
-#### 2.2.3 LightGBM (62维, Optuna 调优) — 旧版本
+#### 2.2.3 LightGBM (Advanced: RDKit+MACCS+ECFP4+Aux, Optuna)
+
+- **脚本:** `train_lightgbm_advanced.py`
+- **特征:** RDKit(217) + MACCS(166) + ECFP4(1024) + Aux(7) = **1415 维**，不进行标准化（树模型对尺度不敏感）
+- **超参数搜索:** Optuna TPE, 50 trials, 5-Fold CV RMSE 最小化，使用 Yeo-Johnson 变换（λ=1.0000，即无变换）
+- **搜索空间（18 个参数 + 3 个 dart 专用参数）:**
+  ```json
+  {
+    "boosting_type": ["gbdt", "dart"],
+    "max_depth": [3, 15],
+    "num_leaves": [15, 255],
+    "learning_rate": [0.001, 0.3] (log),
+    "n_estimators": [500, 3000],
+    "subsample": [0.5, 1.0],
+    "subsample_freq": [1, 10],
+    "colsample_bytree": [0.3, 1.0],
+    "feature_fraction": [0.3, 1.0],
+    "feature_fraction_bynode": [0.3, 1.0],
+    "reg_lambda": [0.0, 30.0],
+    "reg_alpha": [0.0, 30.0],
+    "min_child_weight": [0.01, 50.0] (log),
+    "min_child_samples": [1, 50],
+    "min_data_in_leaf": [1, 100],
+    "min_split_gain": [0.0, 1.0],
+    "lambda_l1": [0.0, 10.0],
+    "lambda_l2": [0.0, 10.0],
+    "drop_rate": [0.0, 0.3] (dart only),
+    "max_drop": [1, 50] (dart only),
+    "skip_drop": [0.0, 0.5] (dart only)
+  }
+  ```
+- **最佳超参数（Trial 9，CV RMSE=0.4616）:**
+  ```json
+  {
+    "boosting_type": "gbdt",
+    "max_depth": 14,
+    "num_leaves": 232,
+    "learning_rate": 0.0370,
+    "n_estimators": 1347,
+    "subsample": 0.6746,
+    "subsample_freq": 8,
+    "colsample_bytree": 0.9280,
+    "feature_fraction": 0.9210,
+    "feature_fraction_bynode": 0.8459,
+    "reg_lambda": 19.261,
+    "reg_alpha": 2.524,
+    "min_child_weight": 0.0396,
+    "min_child_samples": 45,
+    "min_data_in_leaf": 61,
+    "min_split_gain": 0.0092,
+    "lambda_l1": 1.015,
+    "lambda_l2": 6.635
+  }
+  ```
+- **最佳 CV RMSE (5-fold):** 0.4616（Trial 9）
+- **参数重要性 Top 5:** num_leaves (0.390), feature_fraction_bynode (0.188), boosting_type (0.172), reg_alpha (0.054), subsample (0.046)
+- **训练集（全部数据）:** RMSE=0.1270, MAE=0.0877, **R²=0.9863**
+- **测试集（单一模型）:** RMSE=0.3698, MAE=0.2459, **R²=0.8893**
+- **CV Test (5-Fold 集成):** RMSE=0.3976, MAE=0.2744, R²=0.8720
+- **CV R² (变换空间):** [0.541, -0.055, 0.322, 0.585, 0.527]，均值 0.3840 ± 0.2374
+- **特征重要性 Top 5（全为 RDKit 描述符）:** RDKit_130 (1085), RDKit_19 (949), RDKit_5 (831), RDKit_22 (723), RDKit_28 (678)
+- **分析:** 使用 1415 维全量特征（RDKit+MACCS+ECFP4+Aux）进行 Optuna 优化后，测试 R²=**0.8893**，略低于仅使用 217 维 RDKit 描述符的版本（0.8994），差异约 0.01。训练集 R²=0.9863 比 217 维版本（0.9792）更高，但测试集表现略低，表明 MACCS/ECFP4 指纹引入了更多噪声特征，反而轻微降低了泛化性能。特征重要性 Top 20 全部来自 RDKit 描述符，MACCS 和 ECFP4 未进入前 20，说明 RDKit 描述符已包含最关键的结构-性质关系信息。参数重要性分析显示 `num_leaves`（0.390）远超其他参数，表明叶子节点数量是控制模型复杂度最关键的因素。总体而言，使用更大的特征集合（1415 维）并未超越精简的 217 维 RDKit 描述符版本，验证了"并非特征越多越好"的原则。
+
+#### 2.2.4 LightGBM (62维, Optuna 调优) — 旧版本
 
 - **超参数搜索:** Optuna TPE, 60 trials
 - **CV R² (5-fold, tuned):** 0.4035 ± 0.1774
@@ -317,40 +386,43 @@
 | 排名 | 模型 | Test R² | 特点 |
 |------|------|---------|------|
 | **1** | **LightGBM (全描述符, Optuna)** | **0.8994** | Optuna 50 轮调参，无需 GPU，接近 0.90 |
-| 2 | XGBoost (全描述符, 特征选择) | 0.8670 | 217→109 维特征选择 + Optuna 100 轮 |
-| 3 | MLP (全描述符) | 0.8650 | 全部 217 维 RDKit 描述符 |
-| 4 | LightGBM (全描述符, 手动) | 0.8586 | 手动调参，无需 GPU |
-| 5 | MLP (Keras, 62维) | 0.8399 | 3 层 MLP，Adam 优化器 |
-| 6 | MLP (PyTorch, 62维) | 0.8369 | 3 层 MLP，AdamW 优化器 |
-| 7 | RNN (PyTorch LSTM, 全描述符) | 0.8279 | 序列化 217 维描述符，3 层 LSTM |
-| 8 | RNN (Keras, 2 层) | 0.8120 | 更轻量，泛化稳定 |
-| 9 | SVR (RBF) | 0.7835 (Val) | 非深度学习基线，有一定预测能力 |
+| **2** | **LightGBM (Advanced: RDKit+MACCS+ECFP4, Optuna)** | **0.8893** | 1415 维全量特征，50 轮调参，接近最佳 |
+| 3 | XGBoost (全描述符, 特征选择) | 0.8670 | 217→109 维特征选择 + Optuna 100 轮 |
+| 4 | MLP (全描述符) | 0.8650 | 全部 217 维 RDKit 描述符 |
+| 5 | LightGBM (全描述符, 手动) | 0.8586 | 手动调参，无需 GPU |
+| 6 | MLP (Keras, 62维) | 0.8399 | 3 层 MLP，Adam 优化器 |
+| 7 | MLP (PyTorch, 62维) | 0.8369 | 3 层 MLP，AdamW 优化器 |
+| 8 | RNN (PyTorch LSTM, 全描述符) | 0.8279 | 序列化 217 维描述符，3 层 LSTM |
+| 9 | RNN (Keras, 2 层) | 0.8120 | 更轻量，泛化稳定 |
+| 10 | SVR (RBF) | 0.7835 (Val) | 非深度学习基线，有一定预测能力 |
 
 ### 3.2 关键发现
 
-1. **LightGBM + Optuna 全面领先:** 通过 50 轮 Optuna 优化（18 个参数、5-Fold CV 目标），LightGBM 测试 R² 达到 **0.8994**，较手动调参版本（0.8586）提升约 0.04，较此前最佳 MLP 全描述符（0.8650）提升约 0.034。Optuna 自动选择了 gbdt 模式 + 强正则化策略，实现了当前最佳泛化性能。
+1. **LightGBM + Optuna 全面领先:** 通过 50 轮 Optuna 优化（18 个参数、5-Fold CV 目标），LightGBM 纯 RDKit 版本测试 R² 达到 **0.8994**，Advanced 版本（1415 维）紧随其后达 **0.8893**，均大幅超越手动调参版本（0.8586）。Optuna 自动选择了 gbdt 模式 + 强正则化策略，实现了当前最佳泛化性能。
 
-2. **全量描述符优势显著:** 使用全部 217 维 RDKit 描述符的各模型（LightGBM R²=0.899/0.859, MLP R²=0.865, RNN R²=0.828）均超越 62 维精选描述符的最佳结果（0.84），表明更丰富的描述符集合包含了更多有用的结构-性质关系信息。
+2. **特征维度并非越高越好:** Advanced 版本使用 1415 维全量特征（RDKit+MACCS+ECFP4+Aux）的测试 R²=0.8893，反而略低于仅使用 217 维 RDKit 描述符的版本（0.8994），差异约 0.01。特征重要性 Top 20 全部来自 RDKit 描述符，MACCS 和 ECFP4 指纹未进入前列，说明额外的分子指纹引入了噪声而非有效信息。这一结果表明，在充分的超参数优化下，精简的 RDKit 描述符集合已能捕捉绝大部分结构-性质关系，增加指纹特征反而可能降低泛化能力。
 
-3. **LightGBM 全描述符表现亮眼:** LightGBM 手动调参即达测试 R²=**0.8586**，Optuna 优化后进一步提升至 **0.8994**，且无需 GPU，训练集 R²=0.979 过拟合控制优于 MLP（0.988）和 XGBoost（0.990），是生产环境的最优选择。
+3. **全量描述符优势显著:** 使用全部 217 维 RDKit 描述符的各模型（LightGBM R²=0.899/0.859, MLP R²=0.865, RNN R²=0.828）均超越 62 维精选描述符的最佳结果（0.84），表明更丰富的描述符集合包含了更多有用的结构-性质关系信息。
 
-4. **梯度提升树 vs 神经网络:** XGBoost 全描述符版本测试 R²=0.867，略高于 MLP 全描述符（0.865），但 LightGBM（Optuna）以 0.899 全面领先。三种树模型（LightGBM Optuna 0.899 > LightGBM 手动 0.859 ≈ XGBoost 0.867）均表现出与神经网络相当的竞争力。
+4. **LightGBM 全描述符表现亮眼:** LightGBM 手动调参即达测试 R²=**0.8586**，Optuna 优化后进一步提升至 **0.8994**，且无需 GPU，训练集 R²=0.979 过拟合控制优于 MLP（0.988）和 XGBoost（0.990），是生产环境的最优选择。
 
-5. **特征工程有效性:** 62 维 RDKit 描述符+3 层 MLP 即可达到 R²≈0.84，217 维全描述符+LightGBM（Optuna）进一步提升至 0.90，表明充分优化的树模型可以从全量描述符中提取更多有效信息。
+5. **梯度提升树 vs 神经网络:** XGBoost 全描述符版本测试 R²=0.867，略高于 MLP 全描述符（0.865），但 LightGBM（Optuna）以 0.899 全面领先。三种树模型（LightGBM Optuna 0.899 > LightGBM Advanced 0.889 > LightGBM 手动 0.859 ≈ XGBoost 0.867）均表现出与神经网络相当的竞争力。
 
-6. **序列建模 vs 全连接建模:** RNN (PyTorch LSTM) 使用同样的 217 维全描述符，但测试 R²=0.828，低于 MLP 的 0.865 和 LightGBM 的 0.899。这证实分子描述符之间无序，将其作为序列建模是次优策略。LightGBM 的树模型结构和 MLP 的并行特征处理更适合此类结构化描述符数据。
+6. **特征工程有效性:** 62 维 RDKit 描述符+3 层 MLP 即可达到 R²≈0.84，217 维全描述符+LightGBM（Optuna）进一步提升至 0.90，表明充分优化的树模型可以从全量描述符中提取更多有效信息。但继续增加至 1415 维（含 MACCS/ECFP4）后收益递减，提示特征设计应重质量而非数量。
 
-7. **Optuna 调参收益显著:** 从手动调参（R²=0.8586）到 50 轮 Optuna 优化（R²=0.8994），R² 提升 0.04。参数重要性分析显示 boosting_type（0.337）和 subsample（0.251）是最关键的调参方向，未来可针对性地进一步搜索。XGBoost 方面，reg_alpha（0.422）和 gamma（0.395）是最重要的超参数，说明正则化对控制 XGBoost 过拟合至关重要。
+7. **序列建模 vs 全连接建模:** RNN (PyTorch LSTM) 使用同样的 217 维全描述符，但测试 R²=0.828，低于 MLP 的 0.865 和 LightGBM 的 0.899。这证实分子描述符之间无序，将其作为序列建模是次优策略。LightGBM 的树模型结构和 MLP 的并行特征处理更适合此类结构化描述符数据。
 
-8. **SVR 局限:** 非线性核 SVM 在该任务中表现不如树模型和神经网络，可能与描述符空间维度及噪声有关。
+8. **Optuna 调参收益显著:** 从手动调参（R²=0.8586）到 50 轮 Optuna 优化（R²=0.8994），R² 提升 0.04。参数重要性分析显示 boosting_type（0.337）和 subsample（0.251）是最关键的调参方向，未来可针对性地进一步搜索。XGBoost 方面，reg_alpha（0.422）和 gamma（0.395）是最重要的超参数，说明正则化对控制 XGBoost 过拟合至关重要。Advanced 版本中 num_leaves（0.390）重要性远高于其他参数，提示叶子节点数是控制高维特征模型复杂度的关键。
+
+9. **SVR 局限:** 非线性核 SVM 在该任务中表现不如树模型和神经网络，可能与描述符空间维度及噪声有关。
 
 ### 3.3 推荐方案
 
 | 场景 | 推荐模型 | 理由 |
 |------|---------|------|
-| **最佳预测精度** | LightGBM + 全量描述符 (Optuna) | 测试 R²=0.899，当前最高，无需 GPU |
-| **生产部署 / 无需 GPU** | LightGBM + 全量描述符 (Optuna) | 测试 R²=0.899，训练和推理极快 |
-| **快速原型** | LightGBM + 全量描述符 (手动) | 无需调参即达 R²=0.859 |
+| **最佳预测精度** | LightGBM + 全量 RDKit 描述符 (Optuna) | 测试 R²=0.899，当前最高，无需 GPU |
+| **生产部署 / 无需 GPU** | LightGBM + 全量 RDKit 描述符 (Optuna) | 测试 R²=0.899，训练和推理极快 |
+| **快速原型** | LightGBM + 全量 RDKit 描述符 (手动) | 无需调参即达 R²=0.859 |
 | **轻量部署** | MLP (62维) | 特征维度低，R²≈0.84，快速推理 |
 | **待探索** | AttentiveFP (GNN) | 利用分子拓扑结构，可能超越描述符方法 |
 
@@ -364,7 +436,7 @@
 |------|-----|
 | 总训练样本 | 1335 |
 | 含 pCMC 标签 | 1204 (90.2%) |
-| 特征维度 | 62（精选）/ 217（全部 RDKit 描述符） |
+| 特征维度 | 62（精选）/ 217（全部 RDKit 描述符）/ 1415（RDKit+MACCS+ECFP4+Aux） |
 | 目标变量 | pCMC (log CMC) |
 | 其他目标 | AW_ST_CMC, Gamma_max, Area_min, Pi_CMC, pC20 |
 
@@ -375,6 +447,7 @@
 | XGBoost (全描述符, 特征选择) | 特征选择（重要性≥中位数）→ max_depth[3,8], min_child_weight[1,50], gamma[0,10], lr[0.003,0.3], n_estimators[100,2000], subsample[0.4,1.0], colsample_bytree[0.3,1.0], colsample_bylevel[0.3,1.0], reg_lambda[0.1,50], reg_alpha[0.1,50], max_delta_step[0,10] | 100 |
 | XGBoost (旧版, 62维) | max_depth[3,10], lr[0.005,0.1], subsample[0.5,1.0], colsample[0.5,1.0], reg_lambda[0.1,20], n_estimators[200,1000] | 60 |
 | LightGBM (全描述符, Optuna) | boosting_type[gbdt,dart], max_depth[3,15], num_leaves[15,255], lr[0.001,0.3], n_estimators[500,3000], subsample[0.5,1.0], subsample_freq[1,10], colsample_bytree[0.3,1.0], feature_fraction[0.3,1.0], feature_fraction_bynode[0.3,1.0], reg_lambda[0,30], reg_alpha[0,30], min_child_weight[0.01,50], min_child_samples[1,50], min_data_in_leaf[1,100], min_split_gain[0,1] | 50 |
+| LightGBM (Advanced: RDKit+MACCS+ECFP4) | 同上 + lambda_l1[0,10], lambda_l2[0,10], dart 专有参数（drop_rate, max_drop, skip_drop）| 50 |
 | LightGBM (全描述符, 手动) | 手动：max_depth=6, lr=0.05, subsample=0.8, colsample=0.8, reg_lambda=1.0, n_estimators=500 | 手动 |
 | LightGBM (62维) | max_depth[3,10], lr[0.005,0.1], subsample[0.5,1.0], colsample[0.5,1.0], reg_lambda[0.1,20], n_estimators[200,1000] | 60 |
 | SVR | kernel{rbf,poly,sigmoid}, C[0.01,1000], gamma{scale,auto}, epsilon[0.001,1.0] | 60 |
