@@ -441,29 +441,24 @@
 | 9 | RNN (PyTorch LSTM, 全描述符) | 0.8279 | 序列化 217 维描述符，3 层 LSTM |
 | 10 | RNN (Keras, 2 层) | 0.8120 | 更轻量，泛化稳定 |
 | 11 | SVR (RBF) | 0.7835 (Val) | 非深度学习基线，有一定预测能力 |
-| 6 | MLP (Keras, 62维) | 0.8399 | 3 层 MLP，Adam 优化器 |
-| 7 | MLP (PyTorch, 62维) | 0.8369 | 3 层 MLP，AdamW 优化器 |
-| 8 | RNN (PyTorch LSTM, 全描述符) | 0.8279 | 序列化 217 维描述符，3 层 LSTM |
-| 9 | RNN (Keras, 2 层) | 0.8120 | 更轻量，泛化稳定 |
-| 10 | SVR (RBF) | 0.7835 (Val) | 非深度学习基线，有一定预测能力 |
 
 ### 3.2 关键发现
 
-1. **LightGBM + Optuna 全面领先:** 通过 50 轮 Optuna 优化（18 个参数、5-Fold CV 目标），LightGBM 纯 RDKit 版本测试 R² 达到 **0.8994**，Advanced 版本（1415 维）紧随其后达 **0.8893**，均大幅超越手动调参版本（0.8586）。Optuna 自动选择了 gbdt 模式 + 强正则化策略，实现了当前最佳泛化性能。
+1. **CatBoost + Optuna 全面领先，首破 0.90:** 通过 50 轮 Optuna 优化（10 个参数、5-Fold CV 目标），CatBoost 使用全部 217 维 RDKit 描述符，测试 R² 达到 **0.9088**，首次突破 0.90 大关，超越此前最佳 LightGBM（0.8994）。LightGBM 紧随其后达 **0.8994**，Advanced 版本（1415 维）达 **0.8893**。CatBoost 的 `l2_leaf_reg` 参数重要性最高（0.298），说明 L2 正则化是其泛化性能的关键控制点。
 
 2. **特征维度并非越高越好:** Advanced 版本使用 1415 维全量特征（RDKit+MACCS+ECFP4+Aux）的测试 R²=0.8893，反而略低于仅使用 217 维 RDKit 描述符的版本（0.8994），差异约 0.01。特征重要性 Top 20 全部来自 RDKit 描述符，MACCS 和 ECFP4 指纹未进入前列，说明额外的分子指纹引入了噪声而非有效信息。这一结果表明，在充分的超参数优化下，精简的 RDKit 描述符集合已能捕捉绝大部分结构-性质关系，增加指纹特征反而可能降低泛化能力。
 
-3. **全量描述符优势显著:** 使用全部 217 维 RDKit 描述符的各模型（LightGBM R²=0.899/0.859, MLP R²=0.865, RNN R²=0.828）均超越 62 维精选描述符的最佳结果（0.84），表明更丰富的描述符集合包含了更多有用的结构-性质关系信息。
+3. **全量描述符优势显著:** 使用全部 217 维 RDKit 描述符的各模型（CatBoost R²=0.909, LightGBM R²=0.899/0.859, MLP R²=0.865, RNN R²=0.828）均超越 62 维精选描述符的最佳结果（0.84），表明更丰富的描述符集合包含了更多有用的结构-性质关系信息。
 
-4. **LightGBM 全描述符表现亮眼:** LightGBM 手动调参即达测试 R²=**0.8586**，Optuna 优化后进一步提升至 **0.8994**，且无需 GPU，训练集 R²=0.979 过拟合控制优于 MLP（0.988）和 XGBoost（0.990），是生产环境的最优选择。
+4. **CatBoost 超越 LightGBM 成新最佳:** CatBoost（R²=0.909）超越此前 LightGBM（R²=0.899），且无需 GPU、无需特征标准化，训练集 R²=0.999 表明模型容量充足，是当前最佳预测精度的选择。
 
-5. **梯度提升树 vs 神经网络:** XGBoost 全描述符版本测试 R²=0.867，略高于 MLP 全描述符（0.865），但 LightGBM（Optuna）以 0.899 全面领先。三种树模型（LightGBM Optuna 0.899 > LightGBM Advanced 0.889 > LightGBM 手动 0.859 ≈ XGBoost 0.867）均表现出与神经网络相当的竞争力。
+5. **梯度提升树 vs 神经网络:** CatBoost（R²=0.909）和 LightGBM（0.899）全面领先 MLP（0.865）和 XGBoost（0.867）。四种树模型（CatBoost 0.909 > LightGBM Optuna 0.899 > LightGBM Advanced 0.889 > LightGBM 手动 0.859 ≈ XGBoost 0.867）均表现出与神经网络相当的竞争力。
 
-6. **特征工程有效性:** 62 维 RDKit 描述符+3 层 MLP 即可达到 R²≈0.84，217 维全描述符+LightGBM（Optuna）进一步提升至 0.90，表明充分优化的树模型可以从全量描述符中提取更多有效信息。但继续增加至 1415 维（含 MACCS/ECFP4）后收益递减，提示特征设计应重质量而非数量。
+6. **特征工程有效性:** 62 维 RDKit 描述符+3 层 MLP 即可达到 R²≈0.84，217 维全描述符+CatBoost 进一步提升至 0.91，表明充分优化的树模型可以从全量描述符中提取更多有效信息。但继续增加至 1415 维（含 MACCS/ECFP4）后收益递减，提示特征设计应重质量而非数量。
 
 7. **序列建模 vs 全连接建模:** RNN (PyTorch LSTM) 使用同样的 217 维全描述符，但测试 R²=0.828，低于 MLP 的 0.865 和 LightGBM 的 0.899。这证实分子描述符之间无序，将其作为序列建模是次优策略。LightGBM 的树模型结构和 MLP 的并行特征处理更适合此类结构化描述符数据。
 
-8. **Optuna 调参收益显著:** 从手动调参（R²=0.8586）到 50 轮 Optuna 优化（R²=0.8994），R² 提升 0.04。参数重要性分析显示 boosting_type（0.337）和 subsample（0.251）是最关键的调参方向，未来可针对性地进一步搜索。XGBoost 方面，reg_alpha（0.422）和 gamma（0.395）是最重要的超参数，说明正则化对控制 XGBoost 过拟合至关重要。Advanced 版本中 num_leaves（0.390）重要性远高于其他参数，提示叶子节点数是控制高维特征模型复杂度的关键。
+8. **Optuna 调参收益显著:** LightGBM 从手动调参（R²=0.8586）到 50 轮 Optuna 优化（R²=0.8994），R² 提升 0.04。CatBoost 更以 0.9088 创下新高。CatBoost 参数重要性分析显示 l2_leaf_reg（0.298）、random_strength（0.168）和 bagging_temperature（0.112）是最关键的调参方向。LightGBM 方面 boosting_type（0.337）和 subsample（0.251）最值得关注。XGBoost 方面 reg_alpha（0.422）和 gamma（0.395）最重要。
 
 9. **SVR 局限:** 非线性核 SVM 在该任务中表现不如树模型和神经网络，可能与描述符空间维度及噪声有关。
 
@@ -471,8 +466,8 @@
 
 | 场景 | 推荐模型 | 理由 |
 |------|---------|------|
-| **最佳预测精度** | LightGBM + 全量 RDKit 描述符 (Optuna) | 测试 R²=0.899，当前最高，无需 GPU |
-| **生产部署 / 无需 GPU** | LightGBM + 全量 RDKit 描述符 (Optuna) | 测试 R²=0.899，训练和推理极快 |
+| **最佳预测精度** | CatBoost + 全量 RDKit 描述符 (Optuna) | 测试 R²=0.909，当前最高，无需 GPU |
+| **生产部署 / 无需 GPU** | CatBoost / LightGBM + 全量 RDKit 描述符 (Optuna) | CatBoost R²=0.909，LightGBM R²=0.899，训练和推理极快 |
 | **快速原型** | LightGBM + 全量 RDKit 描述符 (手动) | 无需调参即达 R²=0.859 |
 | **轻量部署** | MLP (62维) | 特征维度低，R²≈0.84，快速推理 |
 | **待探索** | AttentiveFP (GNN) | 利用分子拓扑结构，可能超越描述符方法 |
@@ -504,6 +499,7 @@
 | SVR | kernel{rbf,poly,sigmoid}, C[0.01,1000], gamma{scale,auto}, epsilon[0.001,1.0] | 60 |
 | MLP (PyTorch) | lr[1e-4,1e-2], dropout[0.1,0.4], wd[1e-6,1e-3], h1{128,256,512}, h2{64,128,256}, h3{32,64}, bs{16,32,64} | 30 |
 | MLP (全描述符) | lr[1e-4,5e-3], dropout[0.1,0.4], wd[1e-6,1e-3], hidden{128,256,512}, bs{16,32,64} | 30 |
+| CatBoost (全描述符) | depth[4,10], lr[0.01,0.3], iterations[500,3000], l2_leaf_reg[1,50], random_strength[0,10], bagging_temperature[0,10], border_count[32,255], one_hot_max_size[2,50], leaf_estimation_iterations[1,10], min_data_in_leaf[1,50] | 50 |
 | RNN (PyTorch LSTM, 全描述符) | lr[1e-4,5e-3], dropout[0.05,0.4], wd[1e-6,1e-3], hidden_size{32,64,128}, num_layers[1,3], bs{16,32,64} | 30 |
 | RNN (Keras) | lr[1e-4,1e-2], dropout[0.1,0.4], l2[1e-5,1e-3], units_1{64,128,256}, units_2{32,64,128}, bs{16,32,64} | 30 |
 | AttentiveFP | lr[1e-4,5e-3], dropout[0.05,0.4], wd[1e-6,1e-3], hidden_dim{64,128,256}, num_layers[2,5], num_timesteps[2,4], bs{16,32,64} | 30 |
