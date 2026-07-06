@@ -27,12 +27,15 @@
 | **AttentiveFP (GNN)** | PyG | *待运行* | *待运行* | *待运行* | 30 |
 
 > **注:** 除 SVR 仅输出验证集指标外，其余模型均报告测试集结果。  
-> "MLP (全描述符)"、"LightGBM (全描述符)"、"XGBoost (全描述符, 特征选择)" 和 "RNN (PyTorch LSTM, 全描述符)" 使用全部 217 维 RDKit 描述符（XGBoost 进一步经特征选择保留 109 维）；"LightGBM (Advanced)" 使用 1415 维（RDKit 217 + MACCS 166 + ECFP4 1024 + Aux 7）；其余模型基于 62 维精选描述符。
+> "CatBoost (全描述符)"、"MLP (全描述符)"、"LightGBM (全描述符)"、"XGBoost (全描述符, 特征选择)" 和 "RNN (PyTorch LSTM, 全描述符)" 使用全部 217 维 RDKit 描述符（XGBoost 进一步经特征选择保留 109 维）；"LightGBM (Advanced)" 使用 1415 维（RDKit 217 + MACCS 166 + ECFP4 1024 + Aux 7）；其余模型基于 62 维精选描述符。
 
 ### 1.2 详细分集指标
 
 | 模型 | 数据集 | RMSE | MAE | R² |
 |------|--------|------|-----|----|
+| **CatBoost (全描述符, Optuna)** | Train (all) | 0.0377 | 0.0243 | 0.9988 |
+| | Test | **0.3356** | **0.2221** | **0.9088** |
+| | CV (5-fold) | — | — | 0.3827 ± 0.1772 |
 | **LightGBM (全描述符, Optuna)** | Train (all) | 0.1563 | 0.1037 | 0.9792 |
 | | Test | **0.3525** | **0.2391** | **0.8994** |
 | | CV (5-fold) | — | — | 0.4042 ± 0.2155 |
@@ -117,7 +120,7 @@
 
 ### 2.2 LightGBM
 
-#### 2.2.1 LightGBM (全描述符, Optuna 调优) — 当前最佳
+#### 2.2.1 LightGBM (全描述符, Optuna 调优)
 
 - **脚本:** `train_lightgbm_use_all_features.py`
 - **特征:** 全部 217 维 RDKit 分子描述符，经 StandardScaler 标准化
@@ -371,7 +374,49 @@
 - **测试集:** RMSE=0.4610, MAE=0.3152, R²=0.8279
 - **分析:** 使用 217 维全描述符的 LSTM 方法将描述符视为序列（217 时间步），测试 R²=0.828，优于同描述符基线的 Keras RNN（62 维，R²=0.812），但低于 MLP（全描述符，R²=0.865）。这表明分子描述符之间并无显著的序列依赖关系，将描述符作为序列建模并不能带来额外收益，反而因序列建模复杂性引入了不必要的噪声。相比之下，MLP 直接利用所有描述符的并行信息更为高效。
 
-### 2.9 AttentiveFP (GNN)
+### 2.9 CatBoost (全描述符, Optuna) — 当前最佳
+
+- **脚本:** `train_catboost_use_all_features.py`
+- **特征:** 全部 217 维 RDKit 分子描述符，不进行标准化（CatBoost 树模型对特征尺度不敏感）
+- **超参数搜索:** Optuna TPE, 50 trials, 5-Fold CV RMSE 最小化
+- **搜索空间（10 个参数）:**
+  ```json
+  {
+    "depth": [4, 10],
+    "learning_rate": [0.01, 0.3] (log),
+    "iterations": [500, 3000],
+    "l2_leaf_reg": [1.0, 50.0] (log),
+    "random_strength": [0.0, 10.0],
+    "bagging_temperature": [0.0, 10.0],
+    "border_count": [32, 255],
+    "one_hot_max_size": [2, 50],
+    "leaf_estimation_iterations": [1, 10],
+    "min_data_in_leaf": [1, 50]
+  }
+  ```
+- **最佳超参数（5 轮 CV RMSE=0.4450）:**
+  ```json
+  {
+    "depth": 8,
+    "learning_rate": 0.01607,
+    "iterations": 1230,
+    "l2_leaf_reg": 4.192,
+    "random_strength": 4.561,
+    "bagging_temperature": 7.852,
+    "border_count": 76,
+    "one_hot_max_size": 27,
+    "leaf_estimation_iterations": 6,
+    "min_data_in_leaf": 3
+  }
+  ```
+- **最佳 CV RMSE (5-fold):** 0.4450（5 折平均）
+- **参数重要性 Top 5:** l2_leaf_reg (0.298), random_strength (0.168), bagging_temperature (0.112), one_hot_max_size (0.099), depth (0.067)
+- **训练集（全部数据）:** RMSE=0.0377, MAE=0.0243, R²=0.9988
+- **测试集:** RMSE=0.3356, MAE=0.2221, **R²=0.9088**
+- **CV R² (5-fold):** 0.3827 ± 0.1772
+- **分析:** CatBoost 使用全部 217 维 RDKit 描述符 + Optuna 50 轮调参，测试 R²=**0.9088**，超越此前最佳 LightGBM（0.8994），成为当前最优模型。训练集 R²=0.9988 虽表明一定的过拟合，但测试集表现仍领先于所有其他模型。参数重要性分析显示 `l2_leaf_reg`（0.298）是最关键的调参方向，说明 L2 正则化对 CatBoost 的泛化性能影响最大。`random_strength`（0.168）和 `bagging_temperature`（0.112）紧随其后，表明随机化策略对提升 CatBoost 效果也至关重要。
+
+### 2.10 AttentiveFP (GNN)
 
 - **模型:** PyTorch Geometric AttentiveFP
 - **特征:** 分子图（39 维原子特征 + 11 维键特征），在线生成，未预缓存
@@ -385,11 +430,17 @@
 
 | 排名 | 模型 | Test R² | 特点 |
 |------|------|---------|------|
-| **1** | **LightGBM (全描述符, Optuna)** | **0.8994** | Optuna 50 轮调参，无需 GPU，接近 0.90 |
-| **2** | **LightGBM (Advanced: RDKit+MACCS+ECFP4, Optuna)** | **0.8893** | 1415 维全量特征，50 轮调参，接近最佳 |
-| 3 | XGBoost (全描述符, 特征选择) | 0.8670 | 217→109 维特征选择 + Optuna 100 轮 |
-| 4 | MLP (全描述符) | 0.8650 | 全部 217 维 RDKit 描述符 |
-| 5 | LightGBM (全描述符, 手动) | 0.8586 | 手动调参，无需 GPU |
+| **1** | **CatBoost (全描述符, Optuna)** | **0.9088** | Optuna 50 轮调参，无需 GPU，突破 0.90 |
+| **2** | **LightGBM (全描述符, Optuna)** | **0.8994** | Optuna 50 轮调参，无需 GPU，接近 0.90 |
+| **3** | **LightGBM (Advanced: RDKit+MACCS+ECFP4, Optuna)** | **0.8893** | 1415 维全量特征，50 轮调参，接近最佳 |
+| 4 | XGBoost (全描述符, 特征选择) | 0.8670 | 217→109 维特征选择 + Optuna 100 轮 |
+| 5 | MLP (全描述符) | 0.8650 | 全部 217 维 RDKit 描述符 |
+| 6 | LightGBM (全描述符, 手动) | 0.8586 | 手动调参，无需 GPU |
+| 7 | MLP (Keras, 62维) | 0.8399 | 3 层 MLP，Adam 优化器 |
+| 8 | MLP (PyTorch, 62维) | 0.8369 | 3 层 MLP，AdamW 优化器 |
+| 9 | RNN (PyTorch LSTM, 全描述符) | 0.8279 | 序列化 217 维描述符，3 层 LSTM |
+| 10 | RNN (Keras, 2 层) | 0.8120 | 更轻量，泛化稳定 |
+| 11 | SVR (RBF) | 0.7835 (Val) | 非深度学习基线，有一定预测能力 |
 | 6 | MLP (Keras, 62维) | 0.8399 | 3 层 MLP，Adam 优化器 |
 | 7 | MLP (PyTorch, 62维) | 0.8369 | 3 层 MLP，AdamW 优化器 |
 | 8 | RNN (PyTorch LSTM, 全描述符) | 0.8279 | 序列化 217 维描述符，3 层 LSTM |
