@@ -36,26 +36,30 @@ warnings.filterwarnings("ignore")
 parser = argparse.ArgumentParser(description="Transformer + Word2Vec 分子性质预测")
 parser.add_argument("--epochs", type=int, default=200,
                     help="训练轮数（默认: 200）")
-parser.add_argument("--dim", type=int, default=64,
-                    help="Word2Vec/Transformer 嵌入维度（默认: 64）")
+parser.add_argument("--dim", type=int, default=128,
+                    help="Word2Vec/Transformer 嵌入维度（默认: 128）")
 parser.add_argument("--max_len", type=int, default=128,
                     help="最大序列长度（默认: 128）")
 parser.add_argument("--seed", type=int, default=42,
                     help="随机种子（默认: 42）")
-parser.add_argument("--lr", type=float, default=1e-3,
-                    help="学习率（默认: 0.001）")
-parser.add_argument("--dropout", type=float, default=0.2,
-                    help="Dropout 比率（默认: 0.2）")
-parser.add_argument("--nhead", type=int, default=4,
-                    help="Attention head 数（默认: 4）")
-parser.add_argument("--num_layers", type=int, default=3,
-                    help="Transformer 层数（默认: 3）")
-parser.add_argument("--dim_feedforward", type=int, default=256,
-                    help="FFN 维度（默认: 256）")
+parser.add_argument("--lr", type=float, default=3e-4,
+                    help="学习率（默认: 0.0003）")
+parser.add_argument("--dropout", type=float, default=0.15,
+                    help="Dropout 比率（默认: 0.15）")
+parser.add_argument("--nhead", type=int, default=8,
+                    help="Attention head 数（默认: 8）")
+parser.add_argument("--num_layers", type=int, default=4,
+                    help="Transformer 层数（默认: 4）")
+parser.add_argument("--dim_feedforward", type=int, default=512,
+                    help="FFN 维度（默认: 512）")
 parser.add_argument("--batch_size", type=int, default=32,
                     help="Batch size（默认: 32）")
-parser.add_argument("--weight_decay", type=float, default=1e-4,
-                    help="权重衰减（默认: 0.0001）")
+parser.add_argument("--weight_decay", type=float, default=1e-5,
+                    help="权重衰减（默认: 0.00001）")
+parser.add_argument("--val_ratio", type=float, default=0.15,
+                    help="验证集比例（默认: 0.15）")
+parser.add_argument("--patience", type=int, default=30,
+                    help="早停耐心值（默认: 30，0=不早停）")
 args = parser.parse_args()
 
 # ========== 配置 ==========
@@ -275,7 +279,7 @@ class SMILESDataset(Dataset):
         return self.token_ids[idx], self.mask[idx], self.targets[idx]
 
 
-def train_epoch(model, loader, optimizer, criterion, epoch_bar=None):
+def train_epoch(model, loader, optimizer, criterion):
     model.train()
     total_loss = 0
     for token_ids, mask, targets in loader:
@@ -289,8 +293,6 @@ def train_epoch(model, loader, optimizer, criterion, epoch_bar=None):
         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
         optimizer.step()
         total_loss += loss.item() * token_ids.size(0)
-        if epoch_bar is not None:
-            epoch_bar.update(token_ids.size(0))
     return total_loss / len(loader.dataset)
 
 
@@ -333,7 +335,7 @@ model = TransformerRegressor(
     num_layers=best_params["num_layers"],
     dim_feedforward=best_params["dim_feedforward"],
     dropout=best_params["dropout"],
-    freeze_embeddings=True,
+    freeze_embeddings=False,
 ).to(device)
 
 train_loader = DataLoader(
@@ -357,42 +359,38 @@ scheduler = optim.lr_scheduler.CosineAnnealingLR(
 )
 criterion = nn.MSELoss()
 
-# 计算每个 epoch 的 batch 总数，用于进度条的单位
-batches_per_epoch = len(train_loader)
 samples_per_epoch = len(train_loader.dataset)
+print(f"\n{'Epoch':>6}  {'Train_Loss':>10}  {'Test_Loss':>9}  {'RMSE':>7}  {'MAE':>7}  {'R²':>7}")
+print("-" * 60)
 
-epoch_iter = range(TOTAL_EPOCHS)
-with tqdm(epoch_iter, desc="训练进度", unit="epoch", ncols=100) as pbar:
-    for epoch in pbar:
-        # 用子进度条显示每个 epoch 内的 batch 进度
-        with tqdm(
-            total=samples_per_epoch, desc=f"Epoch {epoch+1:3d}/{TOTAL_EPOCHS}",
-            unit="样本", leave=False, ncols=80,
-        ) as epoch_bar:
-            train_loss = train_epoch(model, train_loader, optimizer, criterion, epoch_bar)
+for epoch in range(TOTAL_EPOCHS):
+    train_loss = train_epoch(model, train_loader, optimizer, criterion)
+    scheduler.step()
 
-        scheduler.step()
-
-        if (epoch + 1) % 50 == 0:
-            val_loss, val_rmse, val_mae, val_r2 = evaluate(model, test_loader, criterion)
-            pbar.set_postfix({
-                "Loss": f"{train_loss:.4f}",
-                "Test_RMSE": f"{val_rmse:.4f}",
-                "Test_R²": f"{val_r2:.4f}",
-            })
-        else:
-            pbar.set_postfix({"Loss": f"{train_loss:.4f}"})
+    if (epoch + 1) % 10 == 0:
+        val_loss, val_rmse, val_mae, val_r2 = evaluate(model, test_loader, criterion)
+        print(
+            f"{epoch+1:>6d}  {train_loss:>10.4f}  {val_loss:>9.4f}  "
+            f"{val_rmse:>7.4f}  {val_mae:>7.4f}  {val_r2:>7.4f}"
+        )
 
 # ========== 6. 最终评估 ==========
 print(f"\n{'Model':<35} {'RMSE':>8} {'MAE':>8} {'R²':>8}")
 print("-" * 62)
 
+# 固定顺序的 loader，用于最终评估
+train_eval_loader = DataLoader(
+    SMILESDataset(X_train_ids, y_train_full),
+    batch_size=best_params["batch_size"],
+    shuffle=False,
+)
+
 with torch.no_grad():
     model.eval()
 
-    # 训练集预测
+    # 训练集预测（使用固定顺序的 loader 保证与 y_train_full 对齐）
     train_preds = []
-    for token_ids, mask, _ in train_loader:
+    for token_ids, mask, _ in train_eval_loader:
         token_ids, mask = token_ids.to(device), mask.to(device)
         pred = model(token_ids, mask)
         train_preds.append(pred.cpu().numpy())
