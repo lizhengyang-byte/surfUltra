@@ -27,6 +27,7 @@ import warnings
 from collections import Counter
 from typing import List, Optional
 from tqdm import tqdm
+import optuna
 
 from smiles_to_features_Word2Vec import tokenize_smiles, Word2VecFeaturizer
 
@@ -60,6 +61,10 @@ parser.add_argument("--val_ratio", type=float, default=0.15,
                     help="验证集比例（默认: 0.15）")
 parser.add_argument("--patience", type=int, default=30,
                     help="早停耐心值（默认: 30，0=不早停）")
+parser.add_argument("--optuna_trials", type=int, default=25,
+                    help="Optuna 搜索次数（默认: 25，0=跳过 Optuna）")
+parser.add_argument("--optuna_epochs", type=int, default=60,
+                    help="Optuna 每 trial 的训练轮数（默认: 60）")
 args = parser.parse_args()
 
 # ========== 配置 ==========
@@ -67,6 +72,8 @@ MAX_SEQ_LEN = args.max_len
 W2V_EMBEDDING_DIM = args.dim
 RANDOM_SEED = args.seed
 TOTAL_EPOCHS = args.epochs
+OPTUNA_TRIALS = args.optuna_trials
+OPTUNA_EPOCHS = args.optuna_epochs
 
 # 默认超参数（可通过命令行覆盖）
 best_params = {
@@ -99,13 +106,35 @@ test_smiles  = df_test['SMILES'].tolist()
 
 print(f"训练集: {len(train_smiles)} 条, 测试集: {len(test_smiles)} 条")
 
+# ========== 划分验证集 ==========
+VAL_RATIO = args.val_ratio
+PATIENCE = args.patience
+n_val = max(1, int(len(train_smiles) * VAL_RATIO))
+
+indices = np.arange(len(train_smiles))
+np.random.seed(RANDOM_SEED)
+np.random.shuffle(indices)
+
+val_idx = indices[:n_val]
+train_idx = indices[n_val:]
+
+train_smiles_sub = [train_smiles[i] for i in train_idx]
+val_smiles = [train_smiles[i] for i in val_idx]
+y_train_sub = y_train_full[train_idx]
+y_val = y_train_full[val_idx]
+
+X_train_ids_full = None  # 占位，步骤2填充
+X_val_ids = None
+
+print(f"训练子集: {len(train_smiles_sub)} 条, 验证集: {len(val_smiles)} 条")
+
 # ========== 1. 训练 Word2Vec + 构建词汇表 ==========
 print("\n" + "=" * 60)
 print("步骤 1: 训练 Word2Vec + 构建词汇表")
 print("=" * 60)
 
 featurizer = Word2VecFeaturizer(
-    smiles_list=train_smiles,
+    smiles_list=train_smiles_sub,
     embedding_dim=W2V_EMBEDDING_DIM,
     window=5,
     min_count=2,
@@ -117,7 +146,7 @@ featurizer.train()
 # 构建词汇表（token → id）
 # 特殊 token: PAD=0, UNK=1
 all_tokens: List[str] = []
-for smi in tqdm(train_smiles, desc="收集 token"):
+for smi in tqdm(train_smiles_sub, desc="收集 token"):
     all_tokens.extend(tokenize_smiles(smi))
 
 token_counts = Counter(all_tokens)
@@ -154,11 +183,14 @@ def smiles_to_ids(smiles: str) -> np.ndarray:
 
 
 print("转换训练集 SMILES → token ID...")
-X_train_ids = np.array([smiles_to_ids(smi) for smi in tqdm(train_smiles, desc="训练集")])
+X_train_ids = np.array([smiles_to_ids(smi) for smi in tqdm(train_smiles_sub, desc="训练集")])
+print("转换验证集 SMILES → token ID...")
+X_val_ids = np.array([smiles_to_ids(smi) for smi in tqdm(val_smiles, desc="验证集")])
 print("转换测试集 SMILES → token ID...")
 X_test_ids  = np.array([smiles_to_ids(smi) for smi in tqdm(test_smiles, desc="测试集")])
 
 print(f"训练集序列矩阵: {X_train_ids.shape}")
+print(f"验证集序列矩阵: {X_val_ids.shape}")
 print(f"测试集序列矩阵: {X_test_ids.shape}")
 
 # ========== 3. 定义 Transformer 模型 ==========
@@ -318,9 +350,93 @@ def evaluate(model, loader, criterion):
     )
 
 
+# ========== Optuna 超参数搜索 ==========
+if OPTUNA_TRIALS > 0:
+    print("\n" + "=" * 60)
+    print("Optuna 超参数搜索")
+    print("=" * 60)
+
+    train_loader_opt = DataLoader(
+        SMILESDataset(X_train_ids, y_train_sub),
+        batch_size=32, shuffle=True,
+    )
+    val_loader_opt = DataLoader(
+        SMILESDataset(X_val_ids, y_val),
+        batch_size=32, shuffle=False,
+    )
+    criterion_opt = nn.MSELoss()
+
+    def objective(trial):
+        lr = trial.suggest_float("lr", 1e-4, 1e-3, log=True)
+        dropout = trial.suggest_float("dropout", 0.05, 0.35)
+        weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-4, log=True)
+        nhead = trial.suggest_categorical("nhead", [4, 8])
+        num_layers = trial.suggest_int("num_layers", 2, 4)
+        dim_feedforward = trial.suggest_categorical("dim_feedforward", [256, 512])
+
+        model = TransformerRegressor(
+            vocab_size=vocab_size,
+            d_model=W2V_EMBEDDING_DIM,
+            pretrained_embeddings=embedding_matrix,
+            nhead=nhead,
+            num_layers=num_layers,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            freeze_embeddings=False,
+        ).to(device)
+
+        optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=OPTUNA_EPOCHS, eta_min=1e-6,
+        )
+
+        best_val_r2 = -float("inf")
+        patience_counter = 0
+        opt_patience = max(5, OPTUNA_EPOCHS // 4)
+
+        for epoch in range(OPTUNA_EPOCHS):
+            train_epoch(model, train_loader_opt, optimizer, criterion_opt)
+            scheduler.step()
+
+            if (epoch + 1) % 5 == 0:
+                _, _, _, val_r2 = evaluate(model, val_loader_opt, criterion_opt)
+                trial.report(val_r2, epoch)
+                if trial.should_prune():
+                    raise optuna.TrialPruned()
+
+                if val_r2 > best_val_r2:
+                    best_val_r2 = val_r2
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+
+                if patience_counter >= opt_patience:
+                    break
+
+        return best_val_r2
+
+    study = optuna.create_study(
+        direction="maximize",
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=10),
+        sampler=optuna.samplers.TPESampler(seed=RANDOM_SEED),
+    )
+    study.optimize(objective, n_trials=OPTUNA_TRIALS, show_progress_bar=True)
+
+    print(f"\n┌─ Optuna 搜索完成 ─────────────────────────────")
+    print(f"│ 最佳 Trial: #{study.best_trial.number}")
+    print(f"│ 最佳验证 R²: {study.best_value:.4f}")
+    for k, v in study.best_params.items():
+        print(f"│   {k}: {v}")
+    print(f"└────────────────────────────────────────────────")
+
+    # 将 Optuna 最佳超参数合并到 best_params
+    best_params.update(study.best_params)
+    best_params.setdefault("batch_size", 32)
+
+
 # ========== 5. 训练最终模型 ==========
 print("\n" + "=" * 60)
-print("步骤 4: 在全部训练集上训练 Transformer 模型")
+print(f"步骤 {'4' if OPTUNA_TRIALS > 0 else '3'}: 训练最终模型（全量训练子集）")
 print("=" * 60)
 
 print(f"超参数:")
@@ -339,9 +455,14 @@ model = TransformerRegressor(
 ).to(device)
 
 train_loader = DataLoader(
-    SMILESDataset(X_train_ids, y_train_full),
+    SMILESDataset(X_train_ids, y_train_sub),
     batch_size=best_params["batch_size"],
     shuffle=True,
+)
+val_loader = DataLoader(
+    SMILESDataset(X_val_ids, y_val),
+    batch_size=best_params["batch_size"],
+    shuffle=False,
 )
 test_loader = DataLoader(
     SMILESDataset(X_test_ids, y_test_orig),
@@ -359,31 +480,57 @@ scheduler = optim.lr_scheduler.CosineAnnealingLR(
 )
 criterion = nn.MSELoss()
 
-samples_per_epoch = len(train_loader.dataset)
-print(f"\n{'Epoch':>6}  {'Train_Loss':>10}  {'Test_Loss':>9}  {'RMSE':>7}  {'MAE':>7}  {'R²':>7}")
-print("-" * 60)
+# ========== 早停 + 最佳模型保存 ==========
+best_val_r2 = -float("inf")
+best_epoch = 0
+patience_counter = 0
+best_model_state = None
+
+print(f"\n{'Epoch':>6}  {'Train_Loss':>10}  {'Val_Loss':>9}  {'Val_RMSE':>8}  {'Val_R²':>8}  {'Best_R²':>8}")
+print("-" * 70)
 
 for epoch in range(TOTAL_EPOCHS):
     train_loss = train_epoch(model, train_loader, optimizer, criterion)
     scheduler.step()
 
-    if (epoch + 1) % 10 == 0:
-        val_loss, val_rmse, val_mae, val_r2 = evaluate(model, test_loader, criterion)
+    if (epoch + 1) % 5 == 0:
+        val_loss, val_rmse, val_mae, val_r2 = evaluate(model, val_loader, criterion)
+        marker = ""
+        if val_r2 > best_val_r2:
+            best_val_r2 = val_r2
+            best_epoch = epoch + 1
+            patience_counter = 0
+            best_model_state = model.state_dict()
+            marker = " ◀"
+        else:
+            patience_counter += 1
+
         print(
             f"{epoch+1:>6d}  {train_loss:>10.4f}  {val_loss:>9.4f}  "
-            f"{val_rmse:>7.4f}  {val_mae:>7.4f}  {val_r2:>7.4f}"
+            f"{val_rmse:>8.4f}  {val_r2:>8.4f}  {best_val_r2:>8.4f}{marker}"
         )
 
-# ========== 6. 最终评估 ==========
-print(f"\n{'Model':<35} {'RMSE':>8} {'MAE':>8} {'R²':>8}")
-print("-" * 62)
+        if PATIENCE > 0 and patience_counter >= PATIENCE:
+            print(f"\n⏹️  早停！验证集 R² 连续 {PATIENCE} 轮未提升，最佳 epoch: {best_epoch}")
+            break
 
-# 固定顺序的 loader，用于最终评估
+# 恢复最佳模型
+if best_model_state is not None:
+    model.load_state_dict(best_model_state)
+    print(f"✅ 已恢复最佳模型 (epoch {best_epoch}, Val R²={best_val_r2:.4f})")
+
+# ========== 6. 最终评估（全量训练集 + 测试集）==========
+print("\n转换全量训练集 SMILES → token ID...")
+X_train_full_ids = np.array([smiles_to_ids(smi) for smi in tqdm(train_smiles, desc="全量训练集")])
+
 train_eval_loader = DataLoader(
-    SMILESDataset(X_train_ids, y_train_full),
+    SMILESDataset(X_train_full_ids, y_train_full),
     batch_size=best_params["batch_size"],
     shuffle=False,
 )
+
+print(f"\n{'Model':<35} {'RMSE':>8} {'MAE':>8} {'R²':>8}")
+print("-" * 62)
 
 with torch.no_grad():
     model.eval()
@@ -423,7 +570,7 @@ print("-" * 62)
 print(f"{'SVR (原最佳)':<35} {'0.6826':>8} {'0.4436':>8} {'0.6227':>8}")
 print(f"{'Transformer + Word2Vec (Test)':<35} {test_rmse:>8.4f} {test_mae:>8.4f} {test_r2:>8.4f}")
 
-print(f"\n✅ 最终模型参数:")
+print(f"\n✅ 最终模型参数{'（Optuna 搜索优化）' if OPTUNA_TRIALS > 0 else ''}:")
 print(f"   词汇表大小: {vocab_size}")
 print(f"   Word2Vec 维度 (d_model): {W2V_EMBEDDING_DIM}")
 print(f"   最大序列长度: {MAX_SEQ_LEN}")
@@ -432,9 +579,13 @@ print(f"   Attention Head 数: {best_params['nhead']}")
 print(f"   FFN 维度: {best_params['dim_feedforward']}")
 print(f"   Dropout: {best_params['dropout']:.4f}")
 print(f"   Learning Rate: {best_params['lr']:.6f}")
+print(f"   Weight Decay: {best_params['weight_decay']:.6f}")
 print(f"   Batch Size: {best_params['batch_size']}")
+print(f"   验证集比例: {VAL_RATIO}")
+print(f"   早停耐心: {PATIENCE}")
+print(f"   最佳 epoch: {best_epoch} (Val R²={best_val_r2:.4f})")
 print(f"   训练集 R²: {train_r2:.4f}")
 print(f"   测试集 R²: {test_r2:.4f}")
 
 print(f"\n💡 提示: 可使用命令行参数调整超参数")
-print(f"   例如: python train_transformer_use_Word2Vec.py --epochs 500 --dim 128 --lr 5e-4")
+print(f"   例如: python train_transformer_use_Word2Vec.py --optuna_trials 50 --optuna_epochs 80")

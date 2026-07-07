@@ -22,6 +22,7 @@
 | **MLP (PyTorch, 62维)** | PyTorch | 0.4517 | 0.3231 | 0.8369 | 30 |
 | **RNN (PyTorch LSTM, 全描述符)** | PyTorch | 0.4610 | 0.3152 | 0.8279 | 30 |
 | **RNN (Keras, 62维)** | Keras | 0.4849 | 0.3646 | 0.8120 | 30 |
+| **Transformer + Word2Vec (SMILES 序列, Optuna)** | PyTorch | 0.5083 | 0.3492 | **0.7907** | 25 |
 | **SVR (RBF)** | scikit-learn | 0.5274 (Val) | 0.3978 | 0.7835 (Val) | 60 |
 | **LightGBM (62维, 调优)** | LightGBM | — | — | 0.4035 ± 0.1774 (CV) | 60 |
 | **AttentiveFP (GNN)** | PyG | *待运行* | *待运行* | *待运行* | 30 |
@@ -57,6 +58,9 @@
 | **RNN (PyTorch LSTM, 全描述符)** | Train | 0.1306 | 0.0859 | 0.9855 |
 | | Test | 0.4610 | 0.3152 | 0.8279 |
 | **LightGBM (62维, 调优)** | CV (5-fold) | — | — | 0.4035 ± 0.1774 |
+| **Transformer + Word2Vec (SMILES 序列, Optuna)** | Train | 0.2808 | 0.1917 | 0.9329 |
+| | Test | **0.5083** | **0.3492** | **0.7907** |
+| | Val (15% holdout) | — | — | 0.7928 (best) |
 | **SVR (RBF)** (tuned) | Train | 0.4601 | 0.3492 | 0.8156 |
 | | Val | 0.5274 | 0.3978 | 0.7835 |
 | | CV (5-fold) | — | — | 0.3468 ± 0.1345 |
