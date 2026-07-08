@@ -23,6 +23,7 @@
 | **RNN (PyTorch LSTM, 全描述符)** | PyTorch | 0.4610 | 0.3152 | 0.8279 | 30 |
 | **RNN (Keras, 62维)** | Keras | 0.4849 | 0.3646 | 0.8120 | 30 |
 | **Transformer + Word2Vec (SMILES 序列, Optuna)** | PyTorch | 0.5083 | 0.3492 | **0.7907** | 25 |
+| **Transformer + RDKit (全描述符, Optuna)** | PyTorch | 0.6796 | 0.5033 | **0.6261** | 25 |
 | **Ridge (全描述符, StandardScaler, Optuna)** | scikit-learn | 0.6899 (Val) | 0.5226 | 0.6297 (Val) | 60 |
 | **PCA+OLS (全描述符, 39 主成分)** | scikit-learn | 0.7707 (Val) | 0.5948 | 0.5378 (Val) | — |
 | **OLS (全描述符, StandardScaler)** | scikit-learn | ~1.1337 (Val) | ~0.8994 | ~0.0000 (Val) | — |
@@ -31,7 +32,7 @@
 | **AttentiveFP (GNN)** | PyG | *待运行* | *待运行* | *待运行* | 30 |
 
 > **注:** 除 SVR 仅输出验证集指标外，其余模型均报告测试集结果。  
-> "CatBoost (全描述符)"、"MLP (全描述符)"、"LightGBM (全描述符)"、"XGBoost (全描述符, 特征选择)" 和 "RNN (PyTorch LSTM, 全描述符)" 使用全部 217 维 RDKit 描述符（XGBoost 进一步经特征选择保留 109 维）；"LightGBM (Advanced)" 使用 1415 维（RDKit 217 + MACCS 166 + ECFP4 1024 + Aux 7）；其余模型基于 62 维精选描述符。
+> "CatBoost (全描述符)"、"MLP (全描述符)"、"LightGBM (全描述符)"、"XGBoost (全描述符, 特征选择)"、"RNN (PyTorch LSTM, 全描述符)" 和 "Transformer + RDKit (全描述符)" 使用全部 217 维 RDKit 描述符（XGBoost 进一步经特征选择保留 109 维）；"LightGBM (Advanced)" 使用 1415 维（RDKit 217 + MACCS 166 + ECFP4 1024 + Aux 7）；其余模型基于 62 维精选描述符。
 
 ### 1.2 详细分集指标
 
@@ -64,6 +65,9 @@
 | **Transformer + Word2Vec (SMILES 序列, Optuna)** | Train | 0.2808 | 0.1917 | 0.9329 |
 | | Test | **0.5083** | **0.3492** | **0.7907** |
 | | Val (15% holdout) | — | — | 0.7928 (best) |
+| **Transformer + RDKit (全描述符, Optuna)** | Train (all) | 0.5217 | 0.3870 | 0.7685 |
+| | Test | **0.6796** | **0.5033** | **0.6261** |
+| | Val (15% holdout) | — | — | 0.6672 (best) |
 | **SVR (RBF)** (tuned) | Train | 0.4601 | 0.3492 | 0.8156 |
 | | Val | 0.5274 | 0.3978 | 0.7835 |
 | | CV (5-fold) | — | — | 0.3468 ± 0.1345 |
@@ -430,24 +434,20 @@
 - **CV R² (5-fold):** 0.3827 ± 0.1772
 - **分析:** CatBoost 使用全部 217 维 RDKit 描述符 + Optuna 50 轮调参，测试 R²=**0.9088**，超越此前最佳 LightGBM（0.8994），成为当前最优模型。训练集 R²=0.9988 虽表明一定的过拟合，但测试集表现仍领先于所有其他模型。参数重要性分析显示 `l2_leaf_reg`（0.298）是最关键的调参方向，说明 L2 正则化对 CatBoost 的泛化性能影响最大。`random_strength`（0.168）和 `bagging_temperature`（0.112）紧随其后，表明随机化策略对提升 CatBoost 效果也至关重要。
 
-### 2.11 Transformer + Word2Vec (SMILES 序列建模)
+### 2.10 Transformer + RDKit (全描述符, Optuna)
 
-- **脚本:** `train_transformer_use_Word2Vec.py`
-- **特征:** SMILES 分子序列 → 自训练 Word2Vec 词向量 (dim=128, CBOW) → Token ID 序列 (max_len=128) → Transformer Encoder + Mean Pooling
-- **词汇表:** 41 个有效 token + PAD/UNK = 43（vocab_size=43）
+- **脚本:** `train_transformer_use_all_features.py`
+- **特征:** 全部 217 维 RDKit 分子描述符，经 StandardScaler 标准化，作为 217 个时间步（每步 1 个特征）输入 Transformer Encoder
 - **模型架构:**
-
   ```text
-  Token Embedding (Word2Vec 初始化, 可微调, freeze=False)
-    → Positional Encoding (正弦位置编码)
-    → Transformer Encoder (3 层, nhead=8, FFN=512, dropout=0.167)
-    → Mean Pooling (仅有效 token)
-    → LayerNorm → Dropout → Linear(128→128) → ReLU → Linear(128→1)
+  Linear(1 → d_model=128) 映射每个标量描述符
+    → 正弦位置编码 (Positional Encoding)
+    → Transformer Encoder (3 层, nhead=8, FFN=256, dropout=0.077)
+    → Mean Pooling（对所有时间步平均池化）
+    → LayerNorm → Dropout → Linear(128→128) → ReLU → Dropout → Linear(128→1)
   ```
-
 - **超参数搜索:** Optuna TPE, 25 trials, 每 trial 60 epoch, MedianPruner（n_startup=5, n_warmup_steps=10）
 - **搜索空间（6 个参数）:**
-
   ```json
   {
     "lr": [0.0001, 0.001] (log),
@@ -458,9 +458,54 @@
     "dim_feedforward": [256, 512]
   }
   ```
+- **Optuna 最佳参数（Trial #22）:**
+  ```json
+  {
+    "lr": 0.000679,
+    "dropout": 0.0773,
+    "weight_decay": 5.189e-06,
+    "nhead": 8,
+    "num_layers": 3,
+    "dim_feedforward": 256
+  }
+  ```
+- **最佳验证 R²:** 0.6672（epoch 185）
+- **训练策略:** 85/15 训练/验证划分，CosineAnnealingLR，早停 patience=30，梯度裁剪 5.0
+- **训练集（全量 1204 条）:** RMSE=0.5217, MAE=0.3870, **R²=0.7685**
+- **测试集（全部）:** RMSE=0.6796, MAE=0.5033, **R²=0.6261**
+- **分析:** 该模型将 217 维 RDKit 描述符作为 217 个时间步序列输入 Transformer Encoder，与 RNN (PyTorch LSTM, 全描述符) 的序列建模思路相同，但使用 Self-Attention 替代 LSTM。测试 R²=**0.6261**，低于 RNN（全描述符, R²=0.828）和 MLP（全描述符, R²=0.865）。这一结果进一步验证了关键结论：分子描述符之间无序列依赖关系，将描述符作为序列建模（无论是 RNN 还是 Transformer）都非最优策略。Transformer 在此任务上表现甚至比 RNN 更差（R²=0.626 vs 0.828），可能是因为：
+  1. **归纳偏置不匹配**: Transformer 的位置编码假设序列顺序有意义，而描述符顺序是任意的；
+  2. **数据量不足**: Transformer 通常在万/百万级数据上表现最佳，1204 条样本下难以发挥 Self-Attention 的优势；
+  3. **描述符维度作为序列长度**: 217 个时间步 × 1 维的表示，相比于 MLP 直接使用 217 维向量的全连接结构，信息密度更低。
+  
+  训练集 R²=0.769 是所有深度模型中最低的，说明模型容量未得到充分利用。对比使用相同架构但输入为 SMILES token 序列的 Transformer + Word2Vec（测试 R²=0.791），描述符序列版的 Transformer 反而表现更差，进一步说明将分子描述符组织为序列是次优的特征表示策略。
 
+### 2.11 Transformer + Word2Vec (SMILES 序列建模)
+
+- **脚本:** `train_transformer_use_Word2Vec.py`
+- **特征:** SMILES 分子序列 → 自训练 Word2Vec 词向量 (dim=128, CBOW) → Token ID 序列 (max_len=128) → Transformer Encoder + Mean Pooling
+- **词汇表:** 41 个有效 token + PAD/UNK = 43（vocab_size=43）
+- **模型架构:**
+  ```text
+  Token Embedding (Word2Vec 初始化, 可微调, freeze=False)
+    → Positional Encoding (正弦位置编码)
+    → Transformer Encoder (3 层, nhead=8, FFN=512, dropout=0.167)
+    → Mean Pooling (仅有效 token)
+    → LayerNorm → Dropout → Linear(128→128) → ReLU → Linear(128→1)
+  ```
+- **超参数搜索:** Optuna TPE, 25 trials, 每 trial 60 epoch, MedianPruner（n_startup=5, n_warmup_steps=10）
+- **搜索空间（6 个参数）:**
+  ```json
+  {
+    "lr": [0.0001, 0.001] (log),
+    "dropout": [0.05, 0.35],
+    "weight_decay": [1e-6, 1e-4] (log),
+    "nhead": [4, 8],
+    "num_layers": [2, 4],
+    "dim_feedforward": [256, 512]
+  }
+  ```
 - **Optuna 最佳参数（Trial #20）:**
-
   ```json
   {
     "lr": 0.000614,
@@ -494,13 +539,11 @@
 - **方法:** `sklearn.linear_model.Ridge`，使用 `solver="sag"` 提高数值稳定性
 - **超参数搜索:** Optuna TPE, 60 trials, 3-Fold CV R² 最大化
 - **搜索空间:**
-
   ```json
   {
     "alpha": [0.01, 10000] (log)
   }
   ```
-
 - **最佳 alpha:** 150.21
 - **最佳 CV R² (3-fold):** 0.3308
 - **训练集:** RMSE=0.6440, MAE=0.4939, R²=0.6389
@@ -515,7 +558,7 @@
 - **训练集:** RMSE=0.7306, MAE=0.5657, R²=0.5352
 - **验证集:** RMSE=0.7707, MAE=0.5948, **R²=0.5378**
 - **CV R² (5-fold):** -2.1525 ± 1.7663（部分折严重为负）
-- **分析:** PCA 将 217 维描述符压缩至 39 个不相关主成分后使用 OLS，验证集 R²=0.538，低于 Ridge（0.630）。CV 结果极不稳定（最低 -5.18），说明主成分与 pCMC 之间的线性关系很弱。PCA 虽然解决了多重共线性，但降维丢弃了部分预测信息，且保留的主成分仍不足以通过线性回归有效拟合目标变量。**结论：该任务需要非线性模型，线性方法（OLSandPCA+OLS）力有不逮。
+- **分析:** PCA 将 217 维描述符压缩至 39 个不相关主成分后使用 OLS，验证集 R²=0.538，低于 Ridge（0.630）。CV 结果极不稳定（最低 -5.18），说明主成分与 pCMC 之间的线性关系很弱。PCA 虽然解决了多重共线性，但降维丢弃了部分预测信息，且保留的主成分仍不足以通过线性回归有效拟合目标变量。**结论：该任务需要非线性模型，线性方法（OLS 和 PCA+OLS）力有不逮。**
 
 - **模型:** PyTorch Geometric AttentiveFP
 - **特征:** 分子图（39 维原子特征 + 11 维键特征），在线生成，未预缓存
@@ -541,9 +584,10 @@
 | 10 | RNN (Keras, 2 层) | 0.8120 | 更轻量，泛化稳定 |
 | 11 | **Transformer + Word2Vec (SMILES 序列, Optuna)** | **0.7907** | 端到端 SMILES 序列建模，Optuna 25 轮，自训练词向量 |
 | 12 | SVR (RBF) | 0.7835 (Val) | 非深度学习基线，有一定预测能力 |
-| 13 | **Ridge (全描述符, StandardScaler, Optuna)** | **0.6297 (Val)** | L2 正则化线性模型，217 维全描述符，alpha=150.21 |
-| 14 | PCA+OLS (全描述符, 39 主成分) | 0.5378 (Val) | PCA 降维至 39 维后 OLS |
-| 15 | OLS (全描述符) | ~0.0000 (Val) | 多重共线性导致 OLS 完全失效 |
+| 13 | **Transformer + RDKit (全描述符, Optuna)** | **0.6261** | 描述符序列化 + Transformer Encoder，Optuna 25 轮 |
+| 14 | **Ridge (全描述符, StandardScaler, Optuna)** | **0.6297 (Val)** | L2 正则化线性模型，217 维全描述符，alpha=150.21 |
+| 15 | PCA+OLS (全描述符, 39 主成分) | 0.5378 (Val) | PCA 降维至 39 维后 OLS |
+| 16 | OLS (全描述符) | ~0.0000 (Val) | 多重共线性导致 OLS 完全失效 |
 
 ### 3.2 关键发现
 
@@ -559,7 +603,7 @@
 
 6. **特征工程有效性:** 62 维 RDKit 描述符+3 层 MLP 即可达到 R²≈0.84，217 维全描述符+CatBoost 进一步提升至 0.91，表明充分优化的树模型可以从全量描述符中提取更多有效信息。但继续增加至 1415 维（含 MACCS/ECFP4）后收益递减，提示特征设计应重质量而非数量。
 
-7. **序列建模 vs 全连接建模:** RNN (PyTorch LSTM) 使用同样的 217 维全描述符，但测试 R²=0.828，低于 MLP 的 0.865 和 LightGBM 的 0.899。这证实分子描述符之间无序，将其作为序列建模是次优策略。LightGBM 的树模型结构和 MLP 的并行特征处理更适合此类结构化描述符数据。
+7. **序列建模 vs 全连接建模:** RNN (PyTorch LSTM) 使用同样的 217 维全描述符，但测试 R²=0.828，低于 MLP 的 0.865 和 LightGBM 的 0.899。Transformer + RDKit 将其作为序列建模的测试 R² 仅 0.626，进一步验证分子描述符之间无序，将其作为序列建模是次优策略。LightGBM 的树模型结构和 MLP 的并行特征处理更适合此类结构化描述符数据。
 
 8. **Optuna 调参收益显著:** LightGBM 从手动调参（R²=0.8586）到 50 轮 Optuna 优化（R²=0.8994），R² 提升 0.04。CatBoost 更以 0.9088 创下新高。CatBoost 参数重要性分析显示 l2_leaf_reg（0.298）、random_strength（0.168）和 bagging_temperature（0.112）是最关键的调参方向。LightGBM 方面 boosting_type（0.337）和 subsample（0.251）最值得关注。XGBoost 方面 reg_alpha（0.422）和 gamma（0.395）最重要。
 
@@ -567,7 +611,9 @@
 
 10. **SMILES 序列端到端建模仍落后于描述符方法:** Transformer + Word2Vec 直接从 SMILES token 序列学习，测试 R²=**0.791**，低于所有使用 RDKit 描述符的模型（最佳 CatBoost 0.909）。对比同属"序列建模"的 RNN (PyTorch LSTM, 全描述符, R²=0.828)，Transformer + Word2Vec 的输入是 SMILES token（41 词汇表），而 RNN 输入是 217 维 RDKit 描述符（每个时间步一个描述符）。两者性能差距说明：**预测 pCMC 的关键信息在于分子的物理化学性质（LogP、TPSA 等），而非 SMILES 字符串的 token 级模式**。小数据量下（1204 条），预计算描述符的信息密度远高于模型从序列中自行学习。Transformer + Word2Vec 的训练集 R²=0.933 表明模型仍有容量，瓶颈在于特征表示而非模型架构。改进方向包括：注意力池化代替平均池化、增加 Word2Vec 训练数据、或混合描述符 + 序列的双流架构。
 
-11. **线性模型不足以捕捉 pCMC 的非线性关系:** Ridge 回归（R²=0.630）和 PCA+OLS（R²=0.538）在所有模型中排名靠后，与最佳树模型（CatBoost R²=0.909）差距约 0.28-0.37。217 维 RDKit 描述符之间存在严重的多重共线性，即使是带 L2 正则化的 Ridge（最佳 alpha=150.21）也仅能达到 0.63 的验证集 R²。PCA 降维虽解决了共线性问题但进一步损失了预测信息（R²=0.538）。相比之下，树模型和神经网络能有效捕捉描述符间的非线性交互，验证了该任务建模需要非线性容量的结论。
+11. **Transformer 序列建模描述符效果最差:** Transformer + RDKit（测试 R²=**0.626**）是所有深度模型中表现最差的，甚至低于 Ridge 回归（0.630）。与 RNN（全描述符, R²=0.828）对比表明，Transformer 对 217 维描述符序列的建模能力弱于 LSTM，可能是因为：（a）1204 条样本不足以发挥 Transformer 的大容量优势；（b）描述符按列名排序的"序列"无真实顺序意义，正弦位置编码提供了误导性先验；（c）Self-Attention 的计算效率在短序列（217 步）上不足以体现优势。该结果表明，分子描述符数据的最佳建模方式是 MLP 或树模型的并行特征处理，而非 RNN/Transformer 的序列建模。
+
+12. **线性模型不足以捕捉 pCMC 的非线性关系:** Ridge 回归（R²=0.630）和 PCA+OLS（R²=0.538）在所有模型中排名靠后，与最佳树模型（CatBoost R²=0.909）差距约 0.28-0.37。217 维 RDKit 描述符之间存在严重的多重共线性，即使是带 L2 正则化的 Ridge（最佳 alpha=150.21）也仅能达到 0.63 的验证集 R²。PCA 降维虽解决了共线性问题但进一步损失了预测信息（R²=0.538）。相比之下，树模型和神经网络能有效捕捉描述符间的非线性交互，验证了该任务建模需要非线性容量的结论。
 
 ### 3.3 推荐方案
 
@@ -611,3 +657,5 @@
 | RNN (Keras) | lr[1e-4,1e-2], dropout[0.1,0.4], l2[1e-5,1e-3], units_1{64,128,256}, units_2{32,64,128}, bs{16,32,64} | 30 |
 | AttentiveFP | lr[1e-4,5e-3], dropout[0.05,0.4], wd[1e-6,1e-3], hidden_dim{64,128,256}, num_layers[2,5], num_timesteps[2,4], bs{16,32,64} | 30 |
 | Ridge (全描述符) | alpha[0.01, 10000] (log), solver="sag" | 60 |
+| **Transformer + RDKit (全描述符, Optuna)** | **lr[1e-4,1e-3] (log), dropout[0.05,0.35], weight_decay[1e-6,1e-4] (log), nhead{4,8}, num_layers[2,4], dim_feedforward{256,512}** | **25** |
+| **Transformer + Word2Vec (SMILES 序列, Optuna)** | **lr[1e-4,1e-3] (log), dropout[0.05,0.35], weight_decay[1e-6,1e-4] (log), nhead{4,8}, num_layers[2,4], dim_feedforward{256,512}** | **25** |
