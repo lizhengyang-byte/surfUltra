@@ -23,6 +23,9 @@
 | **RNN (PyTorch LSTM, 全描述符)** | PyTorch | 0.4610 | 0.3152 | 0.8279 | 30 |
 | **RNN (Keras, 62维)** | Keras | 0.4849 | 0.3646 | 0.8120 | 30 |
 | **Transformer + Word2Vec (SMILES 序列, Optuna)** | PyTorch | 0.5083 | 0.3492 | **0.7907** | 25 |
+| **Ridge (全描述符, StandardScaler, Optuna)** | scikit-learn | 0.6899 (Val) | 0.5226 | 0.6297 (Val) | 60 |
+| **PCA+OLS (全描述符, 39 主成分)** | scikit-learn | 0.7707 (Val) | 0.5948 | 0.5378 (Val) | — |
+| **OLS (全描述符, StandardScaler)** | scikit-learn | ~1.1337 (Val) | ~0.8994 | ~0.0000 (Val) | — |
 | **SVR (RBF)** | scikit-learn | 0.5274 (Val) | 0.3978 | 0.7835 (Val) | 60 |
 | **LightGBM (62维, 调优)** | LightGBM | — | — | 0.4035 ± 0.1774 (CV) | 60 |
 | **AttentiveFP (GNN)** | PyG | *待运行* | *待运行* | *待运行* | 30 |
@@ -73,6 +76,13 @@
 | **RNN (Keras, 62维)** | Train | 0.3594 | 0.2628 | 0.8880 |
 | | Val | 0.5444 | 0.3788 | 0.7523 |
 | | Test | 0.4849 | 0.3646 | 0.8120 |
+| **Ridge (全描述符, StandardScaler, Optuna)** | Train | 0.6440 | 0.4939 | 0.6389 |
+| | Val | **0.6899** | **0.5226** | **0.6297** |
+| | CV (5-fold) | — | — | 0.3022 ± 0.1365 |
+| **PCA+OLS (全描述符, 39 主成分)** | Train | 0.7306 | 0.5657 | 0.5352 |
+| | Val | **0.7707** | **0.5948** | **0.5378** |
+| | CV (5-fold) | — | — | -2.1525 ± 1.7663 |
+| **OLS (全描述符, StandardScaler)** | Val | ~1.1337 | ~0.8994 | ~0.0000 |
 
 ---
 
@@ -420,7 +430,92 @@
 - **CV R² (5-fold):** 0.3827 ± 0.1772
 - **分析:** CatBoost 使用全部 217 维 RDKit 描述符 + Optuna 50 轮调参，测试 R²=**0.9088**，超越此前最佳 LightGBM（0.8994），成为当前最优模型。训练集 R²=0.9988 虽表明一定的过拟合，但测试集表现仍领先于所有其他模型。参数重要性分析显示 `l2_leaf_reg`（0.298）是最关键的调参方向，说明 L2 正则化对 CatBoost 的泛化性能影响最大。`random_strength`（0.168）和 `bagging_temperature`（0.112）紧随其后，表明随机化策略对提升 CatBoost 效果也至关重要。
 
-### 2.10 AttentiveFP (GNN)
+### 2.11 Transformer + Word2Vec (SMILES 序列建模)
+
+- **脚本:** `train_transformer_use_Word2Vec.py`
+- **特征:** SMILES 分子序列 → 自训练 Word2Vec 词向量 (dim=128, CBOW) → Token ID 序列 (max_len=128) → Transformer Encoder + Mean Pooling
+- **词汇表:** 41 个有效 token + PAD/UNK = 43（vocab_size=43）
+- **模型架构:**
+
+  ```text
+  Token Embedding (Word2Vec 初始化, 可微调, freeze=False)
+    → Positional Encoding (正弦位置编码)
+    → Transformer Encoder (3 层, nhead=8, FFN=512, dropout=0.167)
+    → Mean Pooling (仅有效 token)
+    → LayerNorm → Dropout → Linear(128→128) → ReLU → Linear(128→1)
+  ```
+
+- **超参数搜索:** Optuna TPE, 25 trials, 每 trial 60 epoch, MedianPruner（n_startup=5, n_warmup_steps=10）
+- **搜索空间（6 个参数）:**
+
+  ```json
+  {
+    "lr": [0.0001, 0.001] (log),
+    "dropout": [0.05, 0.35],
+    "weight_decay": [1e-6, 1e-4] (log),
+    "nhead": [4, 8],
+    "num_layers": [2, 4],
+    "dim_feedforward": [256, 512]
+  }
+  ```
+
+- **Optuna 最佳参数（Trial #20）:**
+
+  ```json
+  {
+    "lr": 0.000614,
+    "dropout": 0.1666,
+    "weight_decay": 1.30e-5,
+    "nhead": 8,
+    "num_layers": 3,
+    "dim_feedforward": 512
+  }
+  ```
+- **最佳验证 R²:** 0.7928（epoch 185）
+- **训练策略:** 80/20 训练/验证划分（1024/180 条），CosineAnnealingLR，早停 patience=30，梯度裁剪 5.0
+- **训练集（全量 1204 条）:** RMSE=0.2808, MAE=0.1917, **R²=0.9329**
+- **测试集（140 条）:** RMSE=0.5083, MAE=0.3492, **R²=0.7907**
+- **分析:** 该模型尝试从 SMILES 分子序列的 token 级表示学习 pCMC 预测，不同于其他所有模型（直接使用 RDKit 分子描述符）。测试 R²=0.791，在排名中位于中后段，低于使用 62 维精选描述符的 Keras MLP（0.840）和 PyTorch MLP（0.837）。主要局限有三：（1）Word2Vec 仅在 1024 条 SMILES 上训练，词汇表仅 41 个 token，词向量质量不足；（2）Mean Pooling 对序列所有位置一视同仁，无法突出头基等关键结构的信息；（3）SMILES 序列的 token 级表示信息密度远低于 RDKit 物理化学描述符（LogP、TPSA 等与 CMC 直接相关）。训练集 R²=0.933 表明模型仍有容量，但特征层面的瓶颈限制了泛化上限。
+
+### 2.12 Multi-Linear Regression (全描述符, StandardScaler / PCA)
+
+- **脚本:** `train_multi_linear_regression_use_all_features.py`
+- **特征:** 全部 217 维 RDKit 分子描述符，经 StandardScaler 标准化，部分使用 PCA 降维
+- **模型对比:**
+
+#### 2.12.1 OLS (Ordinary Least Squares)
+
+- **方法:** `sklearn.linear_model.LinearRegression`，标准最小二乘法
+- **结果:** 验证集 **R² ≈ 0.0000**（预测几乎等于常数均值）
+- **分析:** 217 维全描述符之间存在严重多重共线性，普通最小二乘法的正规方程 (XᵀX)⁻¹ 因矩阵近乎奇异而无法求得稳定解。即使经过 StandardScaler 标准化，OLS 仍完全失效，说明该问题不适合无正则化的线性回归。
+
+#### 2.12.2 Ridge Regression (L2 正则化, Optuna 调优)
+
+- **方法:** `sklearn.linear_model.Ridge`，使用 `solver="sag"` 提高数值稳定性
+- **超参数搜索:** Optuna TPE, 60 trials, 3-Fold CV R² 最大化
+- **搜索空间:**
+
+  ```json
+  {
+    "alpha": [0.01, 10000] (log)
+  }
+  ```
+
+- **最佳 alpha:** 150.21
+- **最佳 CV R² (3-fold):** 0.3308
+- **训练集:** RMSE=0.6440, MAE=0.4939, R²=0.6389
+- **验证集:** RMSE=0.6899, MAE=0.5226, **R²=0.6297**
+- **CV R² (5-fold):** 0.3022 ± 0.1365（[0.534, 0.325, 0.115, 0.297, 0.240]）
+- **分析:** 通过 L2 正则化（alpha=150.21），Ridge 成功解决了 OLS 的多重共线性崩溃问题，验证集 R²=**0.6297**，CV R² 均值 0.302。最佳 alpha 高达 150，说明需要很强的正则化来抑制 217 维描述符间的共线性噪声。CV 折间存在一定波动（0.115 ~ 0.534），部分折泛化较好。相比树模型（CatBoost 0.909、LightGBM 0.899），线性模型 R² 约 0.63 存在显著差距，说明 pCMC 与描述符之间的关系存在明显的非线性——树模型和神经网络能有效捕捉这些非线性模式，而线性模型受限于其假设。
+
+#### 2.12.3 PCA + OLS
+
+- **方法:** PCA 降维（保留 95% 方差）→ 新特征空间上使用 OLS
+- **降维:** 217 维 → **39 主成分**（累积解释 95% 方差）
+- **训练集:** RMSE=0.7306, MAE=0.5657, R²=0.5352
+- **验证集:** RMSE=0.7707, MAE=0.5948, **R²=0.5378**
+- **CV R² (5-fold):** -2.1525 ± 1.7663（部分折严重为负）
+- **分析:** PCA 将 217 维描述符压缩至 39 个不相关主成分后使用 OLS，验证集 R²=0.538，低于 Ridge（0.630）。CV 结果极不稳定（最低 -5.18），说明主成分与 pCMC 之间的线性关系很弱。PCA 虽然解决了多重共线性，但降维丢弃了部分预测信息，且保留的主成分仍不足以通过线性回归有效拟合目标变量。**结论：该任务需要非线性模型，线性方法（OLSandPCA+OLS）力有不逮。
 
 - **模型:** PyTorch Geometric AttentiveFP
 - **特征:** 分子图（39 维原子特征 + 11 维键特征），在线生成，未预缓存
@@ -444,7 +539,11 @@
 | 8 | MLP (PyTorch, 62维) | 0.8369 | 3 层 MLP，AdamW 优化器 |
 | 9 | RNN (PyTorch LSTM, 全描述符) | 0.8279 | 序列化 217 维描述符，3 层 LSTM |
 | 10 | RNN (Keras, 2 层) | 0.8120 | 更轻量，泛化稳定 |
-| 11 | SVR (RBF) | 0.7835 (Val) | 非深度学习基线，有一定预测能力 |
+| 11 | **Transformer + Word2Vec (SMILES 序列, Optuna)** | **0.7907** | 端到端 SMILES 序列建模，Optuna 25 轮，自训练词向量 |
+| 12 | SVR (RBF) | 0.7835 (Val) | 非深度学习基线，有一定预测能力 |
+| 13 | **Ridge (全描述符, StandardScaler, Optuna)** | **0.6297 (Val)** | L2 正则化线性模型，217 维全描述符，alpha=150.21 |
+| 14 | PCA+OLS (全描述符, 39 主成分) | 0.5378 (Val) | PCA 降维至 39 维后 OLS |
+| 15 | OLS (全描述符) | ~0.0000 (Val) | 多重共线性导致 OLS 完全失效 |
 
 ### 3.2 关键发现
 
@@ -465,6 +564,10 @@
 8. **Optuna 调参收益显著:** LightGBM 从手动调参（R²=0.8586）到 50 轮 Optuna 优化（R²=0.8994），R² 提升 0.04。CatBoost 更以 0.9088 创下新高。CatBoost 参数重要性分析显示 l2_leaf_reg（0.298）、random_strength（0.168）和 bagging_temperature（0.112）是最关键的调参方向。LightGBM 方面 boosting_type（0.337）和 subsample（0.251）最值得关注。XGBoost 方面 reg_alpha（0.422）和 gamma（0.395）最重要。
 
 9. **SVR 局限:** 非线性核 SVM 在该任务中表现不如树模型和神经网络，可能与描述符空间维度及噪声有关。
+
+10. **SMILES 序列端到端建模仍落后于描述符方法:** Transformer + Word2Vec 直接从 SMILES token 序列学习，测试 R²=**0.791**，低于所有使用 RDKit 描述符的模型（最佳 CatBoost 0.909）。对比同属"序列建模"的 RNN (PyTorch LSTM, 全描述符, R²=0.828)，Transformer + Word2Vec 的输入是 SMILES token（41 词汇表），而 RNN 输入是 217 维 RDKit 描述符（每个时间步一个描述符）。两者性能差距说明：**预测 pCMC 的关键信息在于分子的物理化学性质（LogP、TPSA 等），而非 SMILES 字符串的 token 级模式**。小数据量下（1204 条），预计算描述符的信息密度远高于模型从序列中自行学习。Transformer + Word2Vec 的训练集 R²=0.933 表明模型仍有容量，瓶颈在于特征表示而非模型架构。改进方向包括：注意力池化代替平均池化、增加 Word2Vec 训练数据、或混合描述符 + 序列的双流架构。
+
+11. **线性模型不足以捕捉 pCMC 的非线性关系:** Ridge 回归（R²=0.630）和 PCA+OLS（R²=0.538）在所有模型中排名靠后，与最佳树模型（CatBoost R²=0.909）差距约 0.28-0.37。217 维 RDKit 描述符之间存在严重的多重共线性，即使是带 L2 正则化的 Ridge（最佳 alpha=150.21）也仅能达到 0.63 的验证集 R²。PCA 降维虽解决了共线性问题但进一步损失了预测信息（R²=0.538）。相比之下，树模型和神经网络能有效捕捉描述符间的非线性交互，验证了该任务建模需要非线性容量的结论。
 
 ### 3.3 推荐方案
 
@@ -507,3 +610,4 @@
 | RNN (PyTorch LSTM, 全描述符) | lr[1e-4,5e-3], dropout[0.05,0.4], wd[1e-6,1e-3], hidden_size{32,64,128}, num_layers[1,3], bs{16,32,64} | 30 |
 | RNN (Keras) | lr[1e-4,1e-2], dropout[0.1,0.4], l2[1e-5,1e-3], units_1{64,128,256}, units_2{32,64,128}, bs{16,32,64} | 30 |
 | AttentiveFP | lr[1e-4,5e-3], dropout[0.05,0.4], wd[1e-6,1e-3], hidden_dim{64,128,256}, num_layers[2,5], num_timesteps[2,4], bs{16,32,64} | 30 |
+| Ridge (全描述符) | alpha[0.01, 10000] (log), solver="sag" | 60 |
