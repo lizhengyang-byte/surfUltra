@@ -1,0 +1,164 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "surfpredict"
+version = "2.0.0"
+description = "表面活性剂界面性质预测系统 — 从 SMILES 分子结构预测 pCMC 等界面性质"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "李尚儒", email = "eng.shangru.li@foxmail.com" },
+]
+maintainers = [
+    { name = "李尚儒", email = "eng.shangru.li@foxmail.com" },
+]
+keywords = [
+    "surfactant", "CMC", "critical micelle concentration",
+    "molecular machine learning", "QSAR", "QSPR",
+    "graph neural network", "XGBoost", "LightGBM",
+    "RDKit", "cheminformatics",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+requires-python = ">=3.11"
+
+dependencies = [
+    # ---- Core scientific ----
+    "numpy>=2.0",
+    "pandas>=3.0",
+    "scipy>=1.14",
+
+    # ---- Cheminformatics ----
+    "rdkit>=2024.9",
+    "scikit-mol>=0.4",
+
+    # ---- Machine Learning / Deep Learning ----
+    "scikit-learn>=1.6",
+    "xgboost>=3.3",
+    "lightgbm>=4.6",
+    "catboost>=1.2",
+
+    # ---- PyTorch ecosystem ----
+    "torch>=2.6",
+    "torch-geometric>=2.8",
+
+    # ---- TensorFlow ----
+    "tensorflow>=2.21",
+
+    # ---- Hyperparameter Optimization ----
+    "optuna>=4.9",
+
+    # ---- Visualization ----
+    "matplotlib>=3.9",
+    "seaborn>=0.13",
+
+    # ---- NLP / Embedding ----
+    "gensim>=4.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "black>=24.0",
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "pre-commit>=3.7",
+]
+doc = [
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.5",
+]
+all = [
+    "surfpredict[dev,doc]",
+]
+
+[project.urls]
+Homepage = "https://github.com/lizhengyang-byte/surfUltra"
+Repository = "https://github.com/lizhengyang-byte/surfUltra"
+BugTracker = "https://github.com/lizhengyang-byte/surfUltra/issues"
+
+[project.scripts]
+surfpredict-predict = "surfpredict.cli:predict"
+surfpredict-train = "surfpredict.cli:train"
+surfpredict-evaluate = "surfpredict.cli:evaluate"
+
+# ============================================================================
+# Tool configuration
+# ============================================================================
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["surfpredict*"]
+
+[tool.setuptools.package-data]
+surfpredict = ["models/*.pkl", "models/*.pth"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle errors
+    "F",  # pyflakes
+    "I",  # isort
+    "N",  # naming
+    "W",  # pycodestyle warnings
+    "UP", # pyupgrade
+]
+ignore = [
+    "E501",  # line too long (handled by formatter)
+    "N802",  # function name should be lowercase (RDKit compat)
+    "N803",  # argument name should be lowercase
+    "N806",  # variable in function should be lowercase
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"train_*.py" = ["N806", "N802"]
+
+[tool.ruff.format]
+quote-style = "single"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::FutureWarning",
+]
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+ignore_missing_imports = true
+allow_untyped_defs = true
+allow_untyped_calls = true
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+# ============================================================================
+# pydantic-style config (for IDE support, not used at runtime)
+# ============================================================================
+[tool.pyright]
+typeCheckingMode = "basic"
+reportMissingImports = true
+reportMissingTypeStubs = false
