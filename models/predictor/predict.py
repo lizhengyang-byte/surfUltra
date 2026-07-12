@@ -14,21 +14,26 @@ import os
 import sys
 import warnings
 
+# Ensure project root is on sys.path for both direct and -m execution
+_project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
 import numpy as np
 import pandas as pd
 import torch
 
-from .featurizer import (
+from models.predictor.featurizer import (
     build_feature_vector_pharmhgt,
     smiles_to_features_all,
 )
-from .model_loader import (
+from models.predictor.model_loader import (
     load_model,
     get_available_models,
     MODEL_FEATURE_MAP,
     WEIGHT_FILES,
 )
-from .pharmhgt_model import build_molecule_data, predict_pharmhgt_batch
+from models.predictor.pharmhgt_model import build_molecule_data, predict_pharmhgt_batch
 
 
 def predict_tree_model(model, smiles_list, feature_fn):
