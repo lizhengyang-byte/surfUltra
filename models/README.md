@@ -55,12 +55,12 @@ python models/predictor/predict.py --list-models
 
 最高层级的接口，一行代码完成预测。内部自动处理模型加载、特征化、聚合和保存。
 
-### 基本用法
+### 1.1 CSV 批量预测 — `predictor()`
 
 ```python
 from models.predictor.API_predictor import predictor
 
-# 使用全部 5 个模型做集成预测（取均值）
+# 使用全部模型做集成预测（取均值）
 df = predictor("input.csv", "output.csv", "all")
 
 # 指定单个模型 + GPU
@@ -70,7 +70,7 @@ df = predictor("input.csv", "output.csv", "catboost_pharmhgt", device="cuda")
 df = predictor("input.csv", "out.csv", "all", smiles_col="smiles_column")
 ```
 
-### API 函数签名
+#### 函数签名
 
 ```python
 def predictor(input_csv, output_csv, model_name, smiles_col='SMILES', device=None)
@@ -84,7 +84,7 @@ def predictor(input_csv, output_csv, model_name, smiles_col='SMILES', device=Non
 | `smiles_col` | SMILES 列名 | `SMILES` |
 | `device` | Torch 设备（`'cpu'` / `'cuda'` / `None` 自动检测） | `None` → 自动 |
 
-### 返回值
+#### 返回值
 
 返回追加了预测列的 `pd.DataFrame`：
 
@@ -94,6 +94,62 @@ def predictor(input_csv, output_csv, model_name, smiles_col='SMILES', device=Non
 | `model_name='all'` | 每个模型一列 `predicted_pCMC_{name}`，再加 `predicted_pCMC`（均值） |
 
 无效 SMILES 对应的预测值会被设为 `NaN`。
+
+### 1.2 直接 SMILES 预测 — `predictor_single()` ✨
+
+无需 CSV 文件，直接传入 SMILES 字符串或列表，返回 Python `dict`。
+
+```python
+from models.predictor.API_predictor import predictor_single
+
+# 单个分子式预测（传入字符串）
+result = predictor_single("CCO", "catboost_pharmhgt")
+print(result['predicted_pCMC'])   # [3.1415]
+
+# 批量预测（传入列表）
+smiles = ["CCO", "CC(=O)O", "CCCCCCCCCCCCCS(=O)(=O)[O-].[Na+]"]
+result = predictor_single(smiles, "catboost_pharmhgt", device="cpu")
+for smi, val in zip(result['smiles'], result['predicted_pCMC']):
+    print(f"{smi:40s} -> {val:.4f}")
+
+# 全部模型集成 + 查看各模型分项
+result = predictor_single("CCO", "all")
+print(result['models_used'])         # 实际使用的模型列表
+print(result['predicted_pCMC_catboost_pharmhgt'])  # 单个模型的分项预测
+
+# 空列表处理（立即返回空结果，不加载模型）
+result = predictor_single([], "catboost_pharmhgt")
+```
+
+#### 函数签名
+
+```python
+def predictor_single(smiles_input, model_name, device=None)
+```
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `smiles_input` | SMILES 字符串 **或** SMILES 字符串列表（传 `[]` 返回空结果） | 必填 |
+| `model_name` | 模型名称（同上，支持 `"all"`） | 必填 |
+| `device` | Torch 设备（`'cpu'` / `'cuda'` / `None` 自动检测） | `None` → 自动 |
+
+#### 返回值
+
+返回 `dict`：
+
+```python
+{
+    'smiles': ["CCO", ...],          # 输入 SMILES 列表
+    'predicted_pCMC': [3.14, ...],   # 预测值（无效 SMILES 为 NaN）
+    'model': 'catboost_pharmhgt',    # 使用的模型名
+    # 当 model_name='all' 时额外包含：
+    'predicted_pCMC_catboost_pharmhgt': [...],  # 各模型的分项
+    'models_used': ['catboost_pharmhgt', ...],  # 实际使用的模型列表
+}
+```
+
+> **提示：** 传入字符串时返回单元素列表（保持与列表输入一致的返回结构），
+> 方便统一处理。可通过 `result['predicted_pCMC'][0]` 获取唯一预测值。
 
 ### 底层 API
 
@@ -140,7 +196,7 @@ preds = predict_pharmhgt_batch(gnn_model, smiles_list)
 
 ## 2. Demo 脚本（demo.py）
 
-快速验证管线是否正常工作的入口脚本，展示三种典型调用方式：
+快速验证管线是否正常工作的入口脚本，展示全部 4 种调用方式：
 
 ```bash
 python models/predictor/demo.py
@@ -148,19 +204,34 @@ python models/predictor/demo.py
 
 ```python
 # demo.py 内部逻辑：
-input_path = Path(__file__).parent / "input.csv.csv"
+from models.predictor.API_predictor import predictor, predictor_single
 
-# 1. 全部模型集成预测
+# 1. CSV 批量预测（predictor）
+input_path = Path(__file__).parent / "input.csv.csv"
 predictor(str(input_path), "output_all.csv", "all")
 
-# 2. 单个模型预测
-predictor(str(input_path), "output_catboost_pharmhgt.csv",
-          "catboost_pharmhgt", device="cpu")
+# 2. 单个分子式预测（predictor_single，传入字符串）
+result = predictor_single("CCO", "catboost_pharmhgt", device="cpu")
+print(result['predicted_pCMC'][0])
 
-# 3. 自定义 SMILES 列名
-predictor(str(input_path), "out_all_default_SMILES_column.csv",
-          "all", smiles_col="SMILES")
+# 3. 多分子列表预测（predictor_single，传入列表）
+result = predictor_single(
+    ["CCO", "CCCCCCCCCCCCCS(=O)(=O)[O-].[Na+]", "CC(=O)O"],
+    "catboost_pharmhgt", device="cpu",
+)
+for smi, val in zip(result['smiles'], result['predicted_pCMC']):
+    print(f"{smi:40s} -> {val:.4f}")
+
+# 4. 空列表处理（predictor_single，传入 []）
+result = predictor_single([], "catboost_pharmhgt")  # 立即返回空结果
 ```
+
+**两种 API 的适用场景对比：**
+
+| API | 输入 | 输出 | 适用场景 |
+|-----|------|------|---------|
+| `predictor()` | CSV 文件路径 | `pd.DataFrame` | 批量离线预测、文件化工作流 |
+| `predictor_single()` | SMILES 字符串/列表 | `dict` | 实时预测、Python 程序内调用 |
 
 **注意**：`demo.py` 路径采用了 `Path(__file__).parent` 定位文件，因此无论从项目根目录还是直接传路径执行都能正确找到 `input.csv.csv`。
 

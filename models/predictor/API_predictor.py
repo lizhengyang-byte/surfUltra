@@ -2,7 +2,7 @@
 API_predictor.py — Programmatic API for pCMC prediction using trained models.
 
 Usage:
-    from models.predictor.API_predictor import predictor
+    from models.predictor.API_predictor import predictor, predictor_single
 
     # Use all available models (ensemble mean)
     df = predictor("input.csv", "output.csv", "all")
@@ -12,6 +12,13 @@ Usage:
 
     # Custom SMILES column name
     df = predictor("input.csv", "out.csv", "all", smiles_col="smiles_column")
+
+    # Predict from a single SMILES string (new)
+    result = predictor_single("CCO", "catboost_pharmhgt")
+    print(result['predicted_pCMC'])
+
+    # Predict from a list of SMILES
+    result = predictor_single(["CCO", "CC(=O)O"], "all")
 """
 
 import os
@@ -145,3 +152,87 @@ def _predict_single(df, smiles_list, model_name, device):
 
     # Also set concise column for single-model case
     df['predicted_pCMC'] = preds
+
+def predictor_single(smiles_input, model_name, device=None):
+    """Predict pCMC from a single SMILES string or a list of SMILES strings.
+
+    Args:
+        smiles_input: A single SMILES string (str) or a list of SMILES strings.
+                      Pass [] to get an empty result structure.
+        model_name: Model name — one of 'catboost_pharmhgt', 'xgboost_pharmhgt',
+                    'lightgbm_pharmhgt', 'pharmhgt_gnn', 'catboost_all', or 'all'
+                    for ensemble mean of all available models.
+        device: Torch device for GNN inference ('cpu', 'cuda', or None for auto)
+
+    Returns:
+        dict with keys:
+            - 'smiles': list of input SMILES strings
+            - 'predicted_pCMC': list of prediction values (float or NaN)
+            - 'model': model name used
+            - If model_name='all': also includes individual model columns
+              (e.g. 'predicted_pCMC_catboost_pharmhgt') and 'models_used'
+    """
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # ---- Normalize input: str -> list, list -> list ----
+    if isinstance(smiles_input, str):
+        smiles_list = [smiles_input]
+        single_input = True
+    elif isinstance(smiles_input, list):
+        smiles_list = smiles_input
+        single_input = False
+    else:
+        raise TypeError(f"smiles_input must be str or list, got {type(smiles_input).__name__}")
+
+    # ---- Handle empty list ----
+    if len(smiles_list) == 0:
+        print("Empty SMILES list — returning empty result.")
+        result = {
+            'smiles': [],
+            'predicted_pCMC': [],
+            'model': model_name,
+        }
+        if model_name == 'all':
+            result['models_used'] = []
+        return result
+
+    # ---- Build a minimal DataFrame for _predict_single to work with ----
+    df = pd.DataFrame({'SMILES': smiles_list})
+
+    # ---- Predict ----
+    if model_name == 'all':
+        available = get_available_models()
+        if not available:
+            raise FileNotFoundError("No model weight files found in weights/ directory.")
+        print(f"Using 'all' -> predicting with {len(available)} models: {available}")
+        for m_name in available:
+            _predict_single(df, smiles_list, m_name, device)
+        df['predicted_pCMC'] = df[[f'predicted_pCMC_{m}' for m in available]].mean(axis=1)
+    else:
+        _predict_single(df, smiles_list, model_name, device)
+
+    # ---- Build result dict ----
+    pred_cols = [c for c in df.columns if c.startswith('predicted_pCMC')]
+    result = {
+        'smiles': smiles_list,
+        'predicted_pCMC': df['predicted_pCMC'].tolist(),
+        'model': model_name,
+    }
+    for col in pred_cols:
+        if col != 'predicted_pCMC':
+            result[col] = df[col].tolist()
+    if model_name == 'all':
+        result['models_used'] = available
+
+    # Print summary
+    n_valid = sum(1 for v in result['predicted_pCMC'] if not np.isnan(v))
+    print(f"\n[Done] {n_valid}/{len(smiles_list)} valid predictions")
+    if single_input:
+        val = result['predicted_pCMC'][0]
+        if np.isnan(val):
+            print(f"   pCMC = NaN (invalid SMILES: '{smiles_list[0]}')")
+        else:
+            print(f"   pCMC = {val:.4f}")
+
+    return result
