@@ -11,14 +11,16 @@ Usage:
     vec_209 = smiles_to_features_all("CCO")
 """
 
-import numpy as np
+import hashlib
 from collections import defaultdict
 
-from rdkit import Chem
-from rdkit.Chem import (
-    rdMolDescriptors, Descriptors, AllChem, MACCSkeys, BRICS, Crippen, rdchem,
+import numpy as np
+
+from rdkit import Chem  # pyright: ignore[reportAttributeAccessIssue]
+from rdkit.Chem import (  # pyright: ignore[reportAttributeAccessIssue]
+    rdMolDescriptors, Descriptors, AllChem, MACCSkeys, BRICS,
 )
-from rdkit.Chem.rdchem import BondType as BT, HybridizationType
+from rdkit.Chem.rdchem import BondType as BT, HybridizationType  # pyright: ignore[reportAttributeAccessIssue]
 
 # ===========================================================================
 # Constants
@@ -164,7 +166,7 @@ def get_reaction_features(mol: Chem.Mol) -> np.ndarray:
             frags.append(f)
         if frags:
             for f in frags:
-                feat[abs(hash(f)) % REACT_FEAT_DIM] += 1.0
+                feat[int(hashlib.md5(f.encode()).hexdigest(), 16) % REACT_FEAT_DIM] += 1.0
             feat = feat / max(len(frags), 1)
     except Exception:
         pass
@@ -236,7 +238,7 @@ def detect_surfactant(smiles: str):
     else:
         all_patts = detectors.get(surf_type, nonionic_patts)
 
-    for name, sma in all_patts:
+    for _, sma in all_patts:
         patt = Chem.MolFromSmarts(sma)
         if patt:
             for m in mol.GetSubstructMatches(patt):
@@ -292,7 +294,7 @@ def detect_surfactant(smiles: str):
 # 3. PharmHGT-style 522-dim feature vector (for tree models 1-4)
 # ===========================================================================
 
-def build_feature_vector_pharmhgt(smiles: str) -> np.ndarray:
+def build_feature_vector_pharmhgt(smiles: str) -> np.ndarray | None:
     """Construct fixed-length 522-dim feature vector for one molecule.
 
     Pipeline:

@@ -27,7 +27,7 @@ Data expected at:
   ./data/surfpro_test.csv     (test, columns: SMILES, type, pCMC, ...)
 """
 
-import os, sys, math, random, warnings
+import os, sys, math, random, warnings, hashlib
 from copy import deepcopy
 from collections import defaultdict
 
@@ -251,7 +251,7 @@ def get_reaction_features(mol: Chem.Mol) -> np.ndarray:
             frags.append(f)
         if frags:
             for f in frags:
-                feat[abs(hash(f)) % REACT_FEAT_DIM] += 1.0
+                feat[int(hashlib.md5(f.encode()).hexdigest(), 16) % REACT_FEAT_DIM] += 1.0
             feat = feat / max(len(frags), 1)
     except Exception:
         pass
