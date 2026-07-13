@@ -1,6 +1,6 @@
 # models/predictor — pCMC 预测模型管线
 
-本目录提供了统一的 **pCMC（临界胶束浓度）** 预测管线，支持 5 个预训练模型和批量 CSV 预测。
+本目录提供了统一的 **pCMC（临界胶束浓度）** 预测管线，支持 5 个预训练模型，提供三种使用方式：**Python API**、**CLI**、**Demo 脚本**。
 
 ## 目录结构
 
@@ -8,12 +8,20 @@
 models/
 ├── predictor/
 │   ├── __init__.py               # 包初始化
+│   ├── API_predictor.py          # Python 程序化 API（推荐）
+│   ├── demo.py                   # 快速 Demo 脚本
 │   ├── predict.py                # CLI 入口（批量预测）
 │   ├── featurizer.py             # 分子特征化（522 维 / 209 维）
 │   ├── model_loader.py           # 5 个预训练模型的统一加载器
 │   ├── pharmhgt_model.py         # PharmHGT 异构图 Transformer 模型定义
 │   ├── retrain_catboost_all.py   # 用全部 RDKit 描述符重新训练 CatBoost
+│   ├── input.csv.csv             # 140 条 SMILES 测试数据（含真实 pCMC 值）
 │   └── weights/                  # 训练好的模型权重文件存放目录
+│       ├── catboost_pharmhgt_model.pkl
+│       ├── xgboost_pharmhgt_model.pkl
+│       ├── lightgbm_pharmhgt_model.pkl
+│       ├── pharmhgt_best_model.pth
+│       └── catboost_all_features_model.pkl
 └── test_data/
     └── surfpro_test_predictions.csv  # 示例预测结果
 ```
@@ -28,7 +36,137 @@ models/
 | `pharmhgt_gnn` | GNN（图神经网络） | — | PharmHGT 异构图 Transformer |
 | `catboost_all` | 全部 RDKit 描述符 | ~209 | CatBoost + Optuna 调参 |
 
-## 1. CLI 使用（predict.py）
+## 快速开始
+
+```bash
+# 方式一：Demo 脚本（推荐快速测试）
+python models/predictor/demo.py
+
+# 方式二：CLI 批量预测
+python models/predictor/predict.py models/predictor/input.csv.csv results.csv
+
+# 方式三：查看可用模型
+python models/predictor/predict.py --list-models
+```
+
+---
+
+## 1. Python API 使用（API_predictor.py 推荐）
+
+最高层级的接口，一行代码完成预测。内部自动处理模型加载、特征化、聚合和保存。
+
+### 基本用法
+
+```python
+from models.predictor.API_predictor import predictor
+
+# 使用全部 5 个模型做集成预测（取均值）
+df = predictor("input.csv", "output.csv", "all")
+
+# 指定单个模型 + GPU
+df = predictor("input.csv", "output.csv", "catboost_pharmhgt", device="cuda")
+
+# 自定义 SMILES 列名
+df = predictor("input.csv", "out.csv", "all", smiles_col="smiles_column")
+```
+
+### API 函数签名
+
+```python
+def predictor(input_csv, output_csv, model_name, smiles_col='SMILES', device=None)
+```
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `input_csv` | 输入 CSV 文件路径 | 必填 |
+| `output_csv` | 输出 CSV 文件路径 | 必填 |
+| `model_name` | 模型名称（参见上表，或用 `"all"` 使用全部） | 必填 |
+| `smiles_col` | SMILES 列名 | `SMILES` |
+| `device` | Torch 设备（`'cpu'` / `'cuda'` / `None` 自动检测） | `None` → 自动 |
+
+### 返回值
+
+返回追加了预测列的 `pd.DataFrame`：
+
+| 模式 | 输出列 |
+|------|--------|
+| 单个模型 | `predicted_pCMC` + `predicted_pCMC_{model_name}` |
+| `model_name='all'` | 每个模型一列 `predicted_pCMC_{name}`，再加 `predicted_pCMC`（均值） |
+
+无效 SMILES 对应的预测值会被设为 `NaN`。
+
+### 底层 API
+
+```python
+from models.predictor.model_loader import load_model, get_available_models
+
+# 查看可用模型
+print(get_available_models())
+
+# 加载树模型（CatBoost / XGBoost / LightGBM）
+tree_model = load_model('catboost_pharmhgt')
+
+# 加载 GNN 模型（可指定设备）
+gnn_model, params, metrics = load_model('pharmhgt_gnn', device='cuda')
+```
+
+```python
+from models.predictor.featurizer import (
+    build_feature_vector_pharmhgt,   # 返回 522 维向量
+    smiles_to_features_all,          # 返回 ~209 维向量
+)
+
+# 单个 SMILES 转特征
+vec_522 = build_feature_vector_pharmhgt("CCO")      # 522-dim
+vec_209 = smiles_to_features_all("CCO")              # 209-dim
+```
+
+```python
+from models.predictor.pharmhgt_model import (
+    build_molecule_data,           # SMILES → PyG HeteroData
+    predict_pharmhgt,              # 单分子预测
+    predict_pharmhgt_batch,        # 批量预测
+)
+
+# 单分子预测
+pred = predict_pharmhgt(gnn_model, "CCO")
+
+# 批量预测
+smiles_list = ["CCO", "CCCO", "C(C)(C)O"]
+preds = predict_pharmhgt_batch(gnn_model, smiles_list)
+```
+
+---
+
+## 2. Demo 脚本（demo.py）
+
+快速验证管线是否正常工作的入口脚本，展示三种典型调用方式：
+
+```bash
+python models/predictor/demo.py
+```
+
+```python
+# demo.py 内部逻辑：
+input_path = Path(__file__).parent / "input.csv.csv"
+
+# 1. 全部模型集成预测
+predictor(str(input_path), "output_all.csv", "all")
+
+# 2. 单个模型预测
+predictor(str(input_path), "output_catboost_pharmhgt.csv",
+          "catboost_pharmhgt", device="cpu")
+
+# 3. 自定义 SMILES 列名
+predictor(str(input_path), "out_all_default_SMILES_column.csv",
+          "all", smiles_col="SMILES")
+```
+
+**注意**：`demo.py` 路径采用了 `Path(__file__).parent` 定位文件，因此无论从项目根目录还是直接传路径执行都能正确找到 `input.csv.csv`。
+
+---
+
+## 3. CLI 使用（predict.py）
 
 ### 基本用法
 
@@ -67,56 +205,11 @@ python models/predictor/predict.py --list-models
 
 无效 SMILES 对应的预测值会被设为 `NaN`。
 
-## 2. Python API 使用
+---
 
-### 模型加载
+## 4. 特征化详解（featurizer.py）
 
-```python
-from models.predictor.model_loader import load_model, get_available_models
-
-# 查看可用模型
-print(get_available_models())
-
-# 加载树模型（CatBoost / XGBoost / LightGBM）
-tree_model = load_model('catboost_pharmhgt')
-
-# 加载 GNN 模型（可指定设备）
-gnn_model, params, metrics = load_model('pharmhgt_gnn', device='cuda')
-```
-
-### 特征化
-
-```python
-from models.predictor.featurizer import (
-    build_feature_vector_pharmhgt,   # 返回 522 维向量
-    smiles_to_features_all,          # 返回 ~209 维向量
-)
-
-# 单个 SMILES 转特征
-vec_522 = build_feature_vector_pharmhgt("CCO")      # 522-dim
-vec_209 = smiles_to_features_all("CCO")              # 209-dim
-```
-
-### GNN 单分子预测
-
-```python
-from models.predictor.pharmhgt_model import (
-    build_molecule_data,           # SMILES → PyG HeteroData
-    predict_pharmhgt,              # 单分子预测
-    predict_pharmhgt_batch,        # 批量预测
-)
-
-# 单分子预测
-pred = predict_pharmhgt(gnn_model, "CCO")
-
-# 批量预测
-smiles_list = ["CCO", "CCCO", "C(C)(C)O"]
-preds = predict_pharmhgt_batch(gnn_model, smiles_list)
-```
-
-## 3. 特征化详解（featurizer.py）
-
-### 3.1 PharmHGT 522 维特征
+### 4.1 PharmHGT 522 维特征
 
 适用于前 4 个模型（`catboost_pharmhgt`、`xgboost_pharmhgt`、`lightgbm_pharmhgt`、`pharmhgt_gnn`）
 
@@ -131,20 +224,22 @@ preds = predict_pharmhgt_batch(gnn_model, smiles_list)
 | 基础分子描述符 | 12 | MW、LogP、TPSA、RotB、HBA、HBD、RingCount 等归一化值 |
 | **总计** | **522** | |
 
-### 3.2 全部 RDKit 描述符 209 维特征
+### 4.2 全部 RDKit 描述符 209 维特征
 
 适用于 `catboost_all` 模型
 
 使用 `Descriptors.descList` 中的所有 200 多个可用描述符，对无效 SMILES 返回全零向量。
 
-### 3.3 表面活性剂检测
+### 4.3 表面活性剂检测
 
 `detect_surfactant()` 可自动识别表面活性剂的：
 - **头基**（亲水基团）：磺酸根、硫酸根、羧基、季铵盐、吡啶等
 - **尾链**（疏水烷基链）：通过 DFS 搜索最长 ≥4 个碳的碳链
 - **类型**：阴离子 / 阳离子 / 非离子 / 两性离子
 
-## 4. 模型结构说明
+---
+
+## 5. 模型结构说明
 
 ### 树模型（CatBoost / XGBoost / LightGBM）
 
@@ -166,7 +261,9 @@ preds = predict_pharmhgt_batch(gnn_model, smiles_list)
 - **输出**：pCMC 预测值（标量）
 - 权重文件格式：`.pth`（PyTorch checkpoint，含 `state_dict`、`params`、`metrics`）
 
-## 5. 模型加载器（model_loader.py）
+---
+
+## 6. 模型加载器（model_loader.py）
 
 提供 5 个专用加载函数 + 1 个通用调度函数：
 
@@ -188,7 +285,9 @@ load_model(model_name, weights_dir='weights/', device='cpu')
 | `pharmhgt_gnn` | `pharmhgt_best_model.pth` |
 | `catboost_all` | `catboost_all_features_model.pkl` |
 
-## 6. 重新训练缺失模型
+---
+
+## 7. 重新训练缺失模型
 
 如果 `--list-models` 显示 `catboost_all` 模型缺失，可以运行：
 
@@ -204,7 +303,9 @@ python models/predictor/retrain_catboost_all.py
 5. 评估测试集性能并输出 Top-20 特征重要性
 6. 将模型保存至 `weights/catboost_all_features_model.pkl`
 
-## 7. 依赖项
+---
+
+## 8. 依赖项
 
 - `rdkit` — 分子处理与特征化
 - `torch` + `torch_geometric` — PharmHGT GNN
@@ -218,3 +319,4 @@ python models/predictor/retrain_catboost_all.py
 
 ```bash
 pip install -e .
+```
