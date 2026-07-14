@@ -266,9 +266,10 @@ def main():
     print(f"  Test R²:   {test_r2:.4f}")
 
     # ---- Save model ----
-    model_path = 'transformer_pharmhgt_model.pkl'
+    model_path = 'models/predictor/weights/transformer_pharmhgt_model.pkl'
     # Save model metadata + state dict
     torch.save({
+        'model_type': 'transformer',
         'input_dim': input_dim,
         'd_model': d_model,
         'nhead': nhead,

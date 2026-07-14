@@ -241,7 +241,7 @@ def main():
 
     # ---- Save model ----
     import joblib
-    model_path = 'lightgbm_pharmhgt_model.pkl'
+    model_path = 'models/predictor/weights/lightgbm_pharmhgt_model.pkl'
     joblib.dump(final_model, model_path)
     print(f"Model saved to {model_path}")
 

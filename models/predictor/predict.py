@@ -1,5 +1,5 @@
 """
-predict.py — CLI entry point for pCMC prediction using all 5 trained models.
+predict.py — CLI entry point for pCMC prediction using all 8 trained models.
 
 Usage:
     python models/predictor/predict.py input.csv output.csv
@@ -34,42 +34,7 @@ from models.predictor.model_loader import (
     WEIGHT_FILES,
 )
 from models.predictor.pharmhgt_model import build_molecule_data, predict_pharmhgt_batch
-
-
-def predict_tree_model(model, smiles_list, feature_fn):
-    """Predict using a tree-based model (CatBoost / XGBoost / LightGBM).
-
-    Args:
-        model: Loaded sklearn-compatible regressor with .predict(X)
-        smiles_list: List of SMILES strings
-        feature_fn: Function to convert SMILES -> feature vector
-
-    Returns:
-        np.ndarray of predictions (NaN for invalid SMILES)
-    """
-    X_list = []
-    valid_mask = []
-
-    for smi in smiles_list:
-        vec = feature_fn(smi)
-        if vec is not None:
-            X_list.append(vec)
-            valid_mask.append(True)
-        else:
-            # Placeholder — will be set to NaN after predict
-            X_list.append(np.zeros(522 if 'pharmhgt' in feature_fn.__name__ else 209,
-                                   dtype=np.float32))
-            valid_mask.append(False)
-
-    if not X_list:
-        return np.array([])
-
-    X = np.array(X_list, dtype=np.float32)
-    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-
-    preds = model.predict(X).astype(np.float64)
-    preds[~np.array(valid_mask)] = np.nan
-    return preds
+from models.predictor.torch_models import predict_torch_model, predict_tree_model
 
 
 def main():
@@ -90,7 +55,8 @@ def main():
     parser.add_argument('--model', '-m', action='append', default=None,
                         help=('Model(s) to use. Repeat flag or use "all". '
                               'Choices: catboost_pharmhgt, xgboost_pharmhgt, '
-                              'lightgbm_pharmhgt, pharmhgt_gnn, catboost_all, all'))
+                              'lightgbm_pharmhgt, pharmhgt_gnn, catboost_all, '
+                              'mlp_pharmhgt, rnn_pharmhgt, transformer_pharmhgt, all'))
     parser.add_argument('--smiles-col', '-s', default='SMILES',
                         help='SMILES column name (default: SMILES)')
     parser.add_argument('--device', '-d', default=None,
@@ -187,7 +153,11 @@ def main():
             except Exception as e:
                 warnings.warn(f"GNN prediction failed: {e}")
                 preds = np.full(len(smiles_list), np.nan, dtype=np.float64)
+        elif model_name in ('mlp_pharmhgt', 'rnn_pharmhgt', 'transformer_pharmhgt'):
+            # PyTorch model path (MLP / RNN / Transformer)
+            preds = predict_torch_model(loaded, smiles_list, build_feature_vector_pharmhgt, device)
         else:
+            # Tree model path (CatBoost / XGBoost / LightGBM / CatBoost all)
             feature_fn = (
                 build_feature_vector_pharmhgt if feature_type == 'pharmhgt_522'
                 else smiles_to_features_all

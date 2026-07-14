@@ -308,7 +308,7 @@ def main():
 
     # ---- Save model ----
     import joblib
-    model_path = 'xgboost_pharmhgt_model.pkl'
+    model_path = 'models/predictor/weights/xgboost_pharmhgt_model.pkl'
     # XGBoost has its own save/load, but we store the sklearn-compatible wrapper
     joblib.dump(final_model, model_path)
     print(f"Model saved to {model_path}")

@@ -252,7 +252,7 @@ def main():
 
     # ---- Save model ----
     import joblib
-    model_path = 'catboost_pharmhgt_model.pkl'
+    model_path = 'models/predictor/weights/catboost_pharmhgt_model.pkl'
     # CatBoost has its own save/load, but we store the sklearn-compatible wrapper
     joblib.dump(final_model, model_path)
     print(f"Model saved to {model_path}")

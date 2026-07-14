@@ -1,6 +1,6 @@
 # models/predictor — pCMC 预测模型管线
 
-本目录提供了统一的 **pCMC（临界胶束浓度）** 预测管线，支持 5 个预训练模型，提供三种使用方式：**Python API**、**CLI**、**Demo 脚本**。
+本目录提供了统一的 **pCMC（临界胶束浓度）** 预测管线，支持 8 个预训练模型，提供三种使用方式：**Python API**、**CLI**、**Demo 脚本**。
 
 ## 目录结构
 
@@ -12,8 +12,9 @@ models/
 │   ├── demo.py                   # 快速 Demo 脚本
 │   ├── predict.py                # CLI 入口（批量预测）
 │   ├── featurizer.py             # 分子特征化（522 维 / 209 维）
-│   ├── model_loader.py           # 5 个预训练模型的统一加载器
+│   ├── model_loader.py           # 8 个预训练模型的统一加载器
 │   ├── pharmhgt_model.py         # PharmHGT 异构图 Transformer 模型定义
+│   ├── torch_models.py           # PyTorch 模型定义（MLP/RNN/Transformer）+ 推理函数
 │   ├── retrain_catboost_all.py   # 用全部 RDKit 描述符重新训练 CatBoost
 │   ├── input.csv.csv             # 140 条 SMILES 测试数据（含真实 pCMC 值）
 │   └── weights/                  # 训练好的模型权重文件存放目录
@@ -21,7 +22,10 @@ models/
 │       ├── xgboost_pharmhgt_model.pkl
 │       ├── lightgbm_pharmhgt_model.pkl
 │       ├── pharmhgt_best_model.pth
-│       └── catboost_all_features_model.pkl
+│       ├── catboost_all_features_model.pkl
+│       ├── mlp_pharmhgt_model.pkl
+│       ├── rnn_pharmhgt_model.pkl
+│       └── transformer_pharmhgt_model.pkl
 └── test_data/
     └── surfpro_test_predictions.csv  # 示例预测结果
 ```
@@ -35,6 +39,9 @@ models/
 | `lightgbm_pharmhgt` | PharmHGT 522 维 | 522 | LightGBM + Optuna 调参 |
 | `pharmhgt_gnn` | GNN（图神经网络） | — | PharmHGT 异构图 Transformer |
 | `catboost_all` | 全部 RDKit 描述符 | ~209 | CatBoost + Optuna 调参 |
+| `mlp_pharmhgt` | PharmHGT 522 维 | 522 | MLP（4 层, 512 隐藏, GELU 激活） |
+| `rnn_pharmhgt` | PharmHGT 522 维 | 522 | RNN-LSTM（3 层, 64 隐藏） |
+| `transformer_pharmhgt` | PharmHGT 522 维 | 522 | Transformer Encoder（d=128, 4 头, 3 层） |
 
 ## 快速开始
 
@@ -282,7 +289,7 @@ python models/predictor/predict.py --list-models
 
 ### 4.1 PharmHGT 522 维特征
 
-适用于前 4 个模型（`catboost_pharmhgt`、`xgboost_pharmhgt`、`lightgbm_pharmhgt`、`pharmhgt_gnn`）
+适用于前 7 个模型（`catboost_pharmhgt`、`xgboost_pharmhgt`、`lightgbm_pharmhgt`、`pharmhgt_gnn`、`mlp_pharmhgt`、`rnn_pharmhgt`、`transformer_pharmhgt`）
 
 | 组块 | 维度 | 说明 |
 |------|------|------|
@@ -332,17 +339,27 @@ python models/predictor/predict.py --list-models
 - **输出**：pCMC 预测值（标量）
 - 权重文件格式：`.pth`（PyTorch checkpoint，含 `state_dict`、`params`、`metrics`）
 
+### PyTorch 模型（MLP / RNN-LSTM / Transformer Encoder）
+
+- **输入**：522 维特征向量（PharmHGT 聚合特征）
+- **模型结构**：
+  - `mlp_pharmhgt`：4 层全连接 (Linear → BatchNorm → GELU → Dropout) → Linear → 输出
+  - `rnn_pharmhgt`：将 522 维视为 522 个时间步 → 3 层 LSTM (64 隐藏) → 最后时刻隐状态 → Linear → 输出
+  - `transformer_pharmhgt`：将 522 维视为序列 → Linear 投影 (d=128) → 位置编码 → 3 层 TransformerEncoder (4 头) → 均值池化 → Linear → 输出
+- **输出**：pCMC 预测值（标量）
+- **权重文件格式**：`.pkl`（torch.save 字典，含 `model_type`、`state_dict`、架构参数）
+
 ---
 
 ## 6. 模型加载器（model_loader.py）
 
-提供 5 个专用加载函数 + 1 个通用调度函数：
+提供 8 个专用加载函数 + 1 个通用调度函数：
 
 ```python
 load_model(model_name, weights_dir='weights/', device='cpu')
 ```
 
-- `model_name` 可选值：`catboost_pharmhgt`、`xgboost_pharmhgt`、`lightgbm_pharmhgt`、`pharmhgt_gnn`、`catboost_all`
+- `model_name` 可选值：`catboost_pharmhgt`、`xgboost_pharmhgt`、`lightgbm_pharmhgt`、`pharmhgt_gnn`、`catboost_all`、`mlp_pharmhgt`、`rnn_pharmhgt`、`transformer_pharmhgt`
 - 权重文件缺失时会抛出 `FileNotFoundError` 并提示解决方法
 - 可通过 `get_available_models()` 检查哪些模型可用
 
@@ -355,6 +372,9 @@ load_model(model_name, weights_dir='weights/', device='cpu')
 | `lightgbm_pharmhgt` | `lightgbm_pharmhgt_model.pkl` |
 | `pharmhgt_gnn` | `pharmhgt_best_model.pth` |
 | `catboost_all` | `catboost_all_features_model.pkl` |
+| `mlp_pharmhgt` | `mlp_pharmhgt_model.pkl` |
+| `rnn_pharmhgt` | `rnn_pharmhgt_model.pkl` |
+| `transformer_pharmhgt` | `transformer_pharmhgt_model.pkl` |
 
 ---
 

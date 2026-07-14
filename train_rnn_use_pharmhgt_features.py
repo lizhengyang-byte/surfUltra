@@ -230,9 +230,10 @@ def main():
     print(f"  Test R²:   {test_r2:.4f}")
 
     # ---- Save model ----
-    model_path = 'rnn_pharmhgt_model.pkl'
+    model_path = 'models/predictor/weights/rnn_pharmhgt_model.pkl'
     # Save model metadata + state dict
     torch.save({
+        'model_type': 'rnn',
         'input_dim': input_dim,
         'n_layers': n_layers,
         'hidden_dim': hidden_dim,

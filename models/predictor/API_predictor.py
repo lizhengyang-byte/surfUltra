@@ -9,6 +9,7 @@ Usage:
 
     # Use a specific model
     df = predictor("input.csv", "output.csv", "catboost_pharmhgt", device="cuda")
+    df = predictor("input.csv", "output.csv", "mlp_pharmhgt", device="cuda")
 
     # Custom SMILES column name
     df = predictor("input.csv", "out.csv", "all", smiles_col="smiles_column")
@@ -38,41 +39,7 @@ from models.predictor.model_loader import (
     MODEL_FEATURE_MAP,
 )
 from models.predictor.pharmhgt_model import predict_pharmhgt_batch
-
-
-def predict_tree_model(model, smiles_list, feature_fn):
-    """Predict using a tree-based model (CatBoost / XGBoost / LightGBM).
-
-    Args:
-        model: Loaded sklearn-compatible regressor with .predict(X)
-        smiles_list: List of SMILES strings
-        feature_fn: Function to convert SMILES -> feature vector
-
-    Returns:
-        np.ndarray of predictions (NaN for invalid SMILES)
-    """
-    X_list = []
-    valid_mask = []
-
-    for smi in smiles_list:
-        vec = feature_fn(smi)
-        if vec is not None:
-            X_list.append(vec)
-            valid_mask.append(True)
-        else:
-            X_list.append(np.zeros(522 if 'pharmhgt' in feature_fn.__name__ else 209,
-                                   dtype=np.float32))
-            valid_mask.append(False)
-
-    if not X_list:
-        return np.array([])
-
-    X = np.array(X_list, dtype=np.float32)
-    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-
-    preds = model.predict(X).astype(np.float64)
-    preds[~np.array(valid_mask)] = np.nan
-    return preds
+from models.predictor.torch_models import predict_torch_model, predict_tree_model
 
 
 def predictor(input_csv, output_csv, model_name, smiles_col='SMILES', device=None):
@@ -137,7 +104,11 @@ def _predict_single(df, smiles_list, model_name, device):
         except Exception as e:
             warnings.warn(f"GNN prediction failed: {e}")
             preds = np.full(len(smiles_list), np.nan, dtype=np.float64)
+    elif model_name in ('mlp_pharmhgt', 'rnn_pharmhgt', 'transformer_pharmhgt'):
+        # PyTorch model path (MLP / RNN / Transformer)
+        preds = predict_torch_model(loaded, smiles_list, build_feature_vector_pharmhgt, device)
     else:
+        # Tree model path (CatBoost / XGBoost / LightGBM / CatBoost all)
         feature_fn = (
             build_feature_vector_pharmhgt if feature_type == 'pharmhgt_522'
             else smiles_to_features_all
@@ -160,8 +131,9 @@ def predictor_single(smiles_input, model_name, device=None):
         smiles_input: A single SMILES string (str) or a list of SMILES strings.
                       Pass [] to get an empty result structure.
         model_name: Model name — one of 'catboost_pharmhgt', 'xgboost_pharmhgt',
-                    'lightgbm_pharmhgt', 'pharmhgt_gnn', 'catboost_all', or 'all'
-                    for ensemble mean of all available models.
+                    'lightgbm_pharmhgt', 'pharmhgt_gnn', 'catboost_all',
+                    'mlp_pharmhgt', 'rnn_pharmhgt', 'transformer_pharmhgt',
+                    or 'all' for ensemble mean of all available models.
         device: Torch device for GNN inference ('cpu', 'cuda', or None for auto)
 
     Returns:

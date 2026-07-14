@@ -52,3 +52,17 @@ print(f"Result: {result['predicted_pCMC'][0]:.4f}")
 # print("S(C1C=CC(=CC=1)CCCCCCCCCC(C)C)(=O)(=O)O")
 # print("=" * 60)
 # print(test_predictor_times(5, "S(C1C=CC(=CC=1)CCCCCCCCCC(C)C)(=O)(=O)O", "catboost_pharmhgt", device="cpu"))
+
+
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+import numpy as np
+
+from models.predictor.API_predictor import predictor, predictor_single
+from models.predictor.model_loader import get_available_models
+
+print("=" * 60)
+print("Available models:", get_available_models())
+print("=" * 60)

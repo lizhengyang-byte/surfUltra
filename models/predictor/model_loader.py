@@ -1,10 +1,11 @@
 """
-model_loader.py — Load any of the 5 trained pCMC prediction models.
+model_loader.py — Load any of the 8 trained pCMC prediction models.
 
 Usage:
     from model_loader import load_model, get_available_models
     model = load_model('catboost_pharmhgt')
     model = load_model('pharmhgt_gnn', device='cuda')
+    model = load_model('mlp_pharmhgt', device='cpu')
     print(get_available_models())
 """
 
@@ -13,6 +14,7 @@ import joblib
 import warnings
 
 from .pharmhgt_model import load_pharmhgt_model
+from .torch_models import load_torch_model
 
 WEIGHTS_DIR = os.path.join(os.path.dirname(__file__), 'weights')
 
@@ -23,6 +25,9 @@ WEIGHT_FILES = {
     'lightgbm_pharmhgt': 'lightgbm_pharmhgt_model.pkl',
     'pharmhgt_gnn': 'pharmhgt_best_model.pth',
     'catboost_all': 'catboost_all_features_model.pkl',
+    'mlp_pharmhgt': 'mlp_pharmhgt_model.pkl',
+    'rnn_pharmhgt': 'rnn_pharmhgt_model.pkl',
+    'transformer_pharmhgt': 'transformer_pharmhgt_model.pkl',
 }
 
 # Feature type each model expects
@@ -32,6 +37,9 @@ MODEL_FEATURE_MAP = {
     'lightgbm_pharmhgt': 'pharmhgt_522',
     'pharmhgt_gnn': 'gnn',
     'catboost_all': 'all_209',
+    'mlp_pharmhgt': 'pharmhgt_522',
+    'rnn_pharmhgt': 'pharmhgt_522',
+    'transformer_pharmhgt': 'pharmhgt_522',
 }
 
 
@@ -91,17 +99,42 @@ def load_catboost_all(weights_dir=WEIGHTS_DIR):
     return joblib.load(path)
 
 
+def load_mlp_pharmhgt(weights_dir=WEIGHTS_DIR, device='cpu'):
+    """Load MLP model (522-dim PharmHGT features, PyTorch)."""
+    path = os.path.join(weights_dir, WEIGHT_FILES['mlp_pharmhgt'])
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Weight file not found: {path}")
+    return load_torch_model(path, device=device)
+
+
+def load_rnn_pharmhgt(weights_dir=WEIGHTS_DIR, device='cpu'):
+    """Load RNN (LSTM) model (522-dim PharmHGT features, PyTorch)."""
+    path = os.path.join(weights_dir, WEIGHT_FILES['rnn_pharmhgt'])
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Weight file not found: {path}")
+    return load_torch_model(path, device=device)
+
+
+def load_transformer_pharmhgt(weights_dir=WEIGHTS_DIR, device='cpu'):
+    """Load Transformer model (522-dim PharmHGT features, PyTorch)."""
+    path = os.path.join(weights_dir, WEIGHT_FILES['transformer_pharmhgt'])
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Weight file not found: {path}")
+    return load_torch_model(path, device=device)
+
+
 def load_model(model_name, weights_dir=WEIGHTS_DIR, device='cpu'):
     """Generic loader — dispatches to the correct loader by model_name.
 
     Args:
         model_name: One of 'catboost_pharmhgt', 'xgboost_pharmhgt',
-                    'lightgbm_pharmhgt', 'pharmhgt_gnn', 'catboost_all'
+                    'lightgbm_pharmhgt', 'pharmhgt_gnn', 'catboost_all',
+                    'mlp_pharmhgt', 'rnn_pharmhgt', 'transformer_pharmhgt'
         weights_dir: Directory containing weight files
-        device: Torch device for GNN model (ignored for tree models)
+        device: Torch device for GNN/PyTorch models (ignored for tree models)
 
     Returns:
-        Loaded model (sklearn-compatible regressor or PharmHGTModel tuple)
+        Loaded model (sklearn-compatible regressor, PharmHGTModel tuple, or nn.Module)
 
     Raises:
         ValueError: Unknown model_name
@@ -113,6 +146,9 @@ def load_model(model_name, weights_dir=WEIGHTS_DIR, device='cpu'):
         'lightgbm_pharmhgt': lambda: load_lightgbm_pharmhgt(weights_dir),
         'pharmhgt_gnn': lambda: load_pharmhgt_gnn(weights_dir, device),
         'catboost_all': lambda: load_catboost_all(weights_dir),
+        'mlp_pharmhgt': lambda: load_mlp_pharmhgt(weights_dir, device),
+        'rnn_pharmhgt': lambda: load_rnn_pharmhgt(weights_dir, device),
+        'transformer_pharmhgt': lambda: load_transformer_pharmhgt(weights_dir, device),
     }
     if model_name not in loaders:
         raise ValueError(

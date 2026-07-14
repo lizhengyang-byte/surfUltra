@@ -230,9 +230,10 @@ def main():
     print(f"  Test R²:   {test_r2:.4f}")
 
     # ---- Save model ----
-    model_path = 'mlp_pharmhgt_model.pkl'
+    model_path = 'models/predictor/weights/mlp_pharmhgt_model.pkl'
     # Save full model (architecture + weights) as a state dict wrapper
     torch.save({
+        'model_type': 'mlp',
         'input_dim': input_dim,
         'n_layers': n_layers,
         'hidden_dim': hidden_dim,
