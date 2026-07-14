@@ -1,10 +1,9 @@
-"""
-train_xgboost_use_pharmhgt_features.py — XGBoost with PharmHGT-style Featurization
-==================================================================================
+﻿"""
+train_xgboost_use_pharmhgt_features.py 鈥?XGBoost with PharmHGT-style Featurization
+===================================================================================
 
-Keeps all feature extraction from pharmhgt_logcmc.py unchanged (atom 55-dim,
-bond 14-dim, pharmacophore MACCS 194-dim, BRICS 34-dim, surfactant detection),
-then aggregates them into per-molecule feature vectors for XGBoost.
+Uses shared featurization from smiles_to_features_pharmhgt.py (522-dim).
+Features are cached under data/features/pharmhgt/ after first computation.
 
 Usage:
   python train_xgboost_use_pharmhgt_features.py
@@ -14,20 +13,13 @@ Data:
   ./data/surfpro_test.csv     (test)
 """
 
-import os, sys, math, random, warnings, hashlib
-from copy import deepcopy
-from collections import defaultdict
+import os, sys, math, random, warnings, zlib
 
 import numpy as np
 import pandas as pd
 
-# RDKit
-from rdkit import Chem, RDLogger
-RDLogger.logger().setLevel(RDLogger.ERROR)
-from rdkit.Chem import (
-    rdMolDescriptors, Descriptors, AllChem, MACCSkeys, BRICS, Crippen, rdchem
-)
-from rdkit.Chem.rdchem import BondType as BT, HybridizationType
+# Shared featurization
+from smiles_to_features_pharmhgt import load_or_compute_features, FEATURE_NAMES
 
 # XGBoost
 import xgboost as xgb
@@ -40,419 +32,9 @@ from optuna.pruners import MedianPruner
 
 warnings.filterwarnings('ignore')
 
-# ===========================================================================
-# Constants (same as pharmhgt_logcmc.py)
-# ===========================================================================
-ATOM_FEAT_DIM = 55
-BOND_FEAT_DIM = 14
-PHARM_FEAT_DIM = 194   # MACCS keys
-REACT_FEAT_DIM = 34    # BRICS bond types
 
 # ===========================================================================
-# 1. Feature Extraction — Atom-level (55-dim) & Bond-level (14-dim)
-#   EXACTLY as in pharmhgt_logcmc.py
-# ===========================================================================
-
-_ATOM_TYPES = [1, 3, 5, 6, 7, 8, 9, 11, 14, 15, 16, 17, 19, 35, 53, 79]
-_ATOM_TYPE_TO_IDX = {at: i for i, at in enumerate(_ATOM_TYPES)}
-_NUM_ATOM_TYPES = len(_ATOM_TYPES)  # 16
-
-_HYBRIDIZATION_TYPES = [
-    HybridizationType.SP, HybridizationType.SP2, HybridizationType.SP3,
-    HybridizationType.SP3D, HybridizationType.SP3D2
-]
-_HYB_TO_IDX = {h: i for i, h in enumerate(_HYBRIDIZATION_TYPES)}
-
-
-def get_atom_features(atom: Chem.Atom) -> np.ndarray:
-    """55-dim atom feature vector.
-
-    [0:16]    Atom type one-hot (16 elements)
-    [16:22]   Degree one-hot (0-5+)
-    [22]      Formal charge (normalized [-2,2]→[-1,1])
-    [23:28]   Implicit Hs one-hot (0-4+)
-    [28:33]   Hybridization one-hot
-    [33]      Is aromatic
-    [34]      In ring
-    [35]      Mass / 100
-    [36]      Chiral center
-    [37]      Radical electrons / 2
-    [38:42]   Explicit valence one-hot (1-5+)
-    [42:46]   Ring size one-hot (3,4,5,6)
-    [46:50]   Gasteiger charge bins
-    [50]      Ring >= 7
-    [51]      N or O
-    [52]      H donor
-    [53]      H acceptor
-    [54]      Heavy neighbors / 4
-    """
-    feat = np.zeros(55, dtype=np.float32)
-    mol = atom.GetOwningMol()
-
-    atomic_num = atom.GetAtomicNum()
-    type_idx = _ATOM_TYPE_TO_IDX.get(atomic_num, len(_ATOM_TYPES) - 1)
-    feat[type_idx] = 1.0
-
-    deg = min(atom.GetDegree(), 5)
-    feat[16 + deg] = 1.0
-
-    fc = np.clip(atom.GetFormalCharge(), -2, 2) / 2.0
-    feat[22] = fc
-
-    imp_h = min(atom.GetTotalNumHs(includeNeighbors=False), 4)
-    feat[23 + imp_h] = 1.0
-
-    hyb = atom.GetHybridization()
-    feat[28 + _HYB_TO_IDX.get(hyb, 0)] = 1.0
-
-    feat[33] = 1.0 if atom.GetIsAromatic() else 0.0
-    feat[34] = 1.0 if atom.IsInRing() else 0.0
-    feat[35] = atom.GetMass() / 100.0
-
-    if atom.GetChiralTag() != Chem.rdchem.ChiralType.CHI_UNSPECIFIED:
-        feat[36] = 1.0
-
-    feat[37] = min(atom.GetNumRadicalElectrons(), 2) / 2.0
-
-    val = atom.GetExplicitValence()
-    if 1 <= val <= 4:
-        feat[37 + val] = 1.0
-    elif val >= 5:
-        feat[41] = 1.0
-
-    if atom.IsInRing():
-        for ring in mol.GetRingInfo().AtomRings():
-            if atom.GetIdx() in ring:
-                sz = len(ring)
-                if 3 <= sz <= 6:
-                    feat[41 + sz - 2] = 1.0
-                if sz >= 7:
-                    feat[50] = 1.0
-                break
-
-    try:
-        gc = float(atom.GetDoubleProp('_GasteigerCharge'))
-        if np.isfinite(gc):
-            gc = np.clip(gc, -1.0, 1.0)
-            feat[46 + min(int((gc + 1.0) / 0.5), 3)] = 1.0
-    except (KeyError, ValueError):
-        pass
-
-    feat[51] = 1.0 if atomic_num in (7, 8) else 0.0
-    if atomic_num in (7, 8) and atom.GetTotalNumHs() > 0:
-        feat[52] = 1.0
-    feat[53] = 1.0 if atomic_num in (7, 8) else 0.0
-    feat[54] = atom.GetDegree() / 4.0
-
-    return feat
-
-
-_BOND_TYPE_MAP = {
-    BT.SINGLE: 0, BT.DOUBLE: 1, BT.TRIPLE: 2, BT.AROMATIC: 3,
-}
-_BOND_STEREO_MAP = {
-    Chem.rdchem.BondStereo.STEREONONE: 0,
-    Chem.rdchem.BondStereo.STEREOANY: 1,
-    Chem.rdchem.BondStereo.STEREOZ: 2,
-    Chem.rdchem.BondStereo.STEREOE: 3,
-    Chem.rdchem.BondStereo.STEREOCIS: 4,
-    Chem.rdchem.BondStereo.STEREOTRANS: 5,
-}
-
-
-def get_bond_features(bond: Chem.Bond) -> np.ndarray:
-    """14-dim bond feature vector.
-
-    [0:4]   Bond type
-    [4]     Conjugated
-    [5]     In ring
-    [6:12]  Stereo
-    [12]    Aromatic
-    [13]    In ring
-    """
-    feat = np.zeros(14, dtype=np.float32)
-    feat[_BOND_TYPE_MAP.get(bond.GetBondType(), 0)] = 1.0
-    feat[4] = 1.0 if bond.GetIsConjugated() else 0.0
-    feat[5] = 1.0 if bond.IsInRing() else 0.0
-    feat[6 + _BOND_STEREO_MAP.get(bond.GetStereo(), 0)] = 1.0
-    feat[12] = 1.0 if bond.GetBondType() == BT.AROMATIC else 0.0
-    feat[13] = 1.0 if bond.IsInRing() else 0.0
-    return feat
-
-
-# ===========================================================================
-# 2. Pharmacophore & Reaction Features (Gβ)
-#   EXACTLY as in pharmhgt_logcmc.py
-# ===========================================================================
-
-def get_pharmacophore_features(mol: Chem.Mol) -> np.ndarray:
-    """194-dim: MACCS keys padded to 194."""
-    feat = np.zeros(PHARM_FEAT_DIM, dtype=np.float32)
-    try:
-        maccs = MACCSkeys.GenMACCSKeys(mol)
-        bits = np.array(list(maccs.ToBitString()), dtype=np.float32)
-        n = min(len(bits), PHARM_FEAT_DIM)
-        feat[:n] = bits[:n]
-    except Exception:
-        pass
-    return feat
-
-
-def get_reaction_features(mol: Chem.Mol) -> np.ndarray:
-    """34-dim: BRICS fragment type histogram.
-
-    Falls back gracefully if BRICS decomposition fails or hangs.
-    """
-    feat = np.zeros(REACT_FEAT_DIM, dtype=np.float32)
-    try:
-        n_rot = Descriptors.NumRotatableBonds(mol)
-        if n_rot < 1:
-            return feat
-        frags_gen = BRICS.BRICSDecompose(mol, returnMols=False)
-        frags = []
-        for i, f in enumerate(frags_gen):
-            if i >= 128:  # safety limit
-                break
-            frags.append(f)
-        if frags:
-            for f in frags:
-                feat[int(hashlib.md5(f.encode()).hexdigest(), 16) % REACT_FEAT_DIM] += 1.0
-            feat = feat / max(len(frags), 1)
-    except Exception:
-        pass
-    return feat
-
-
-# ===========================================================================
-# 3. Surfactant Detection
-#   EXACTLY as in pharmhgt_logcmc.py
-# ===========================================================================
-
-SURF_TYPE_ANIONIC = 'anionic'
-SURF_TYPE_CATIONIC = 'cationic'
-SURF_TYPE_NONIONIC = 'nonionic'
-SURF_TYPE_ZWITTERIONIC = 'zwitterionic'
-SURF_TYPES = [SURF_TYPE_ANIONIC, SURF_TYPE_CATIONIC, SURF_TYPE_NONIONIC, SURF_TYPE_ZWITTERIONIC]
-SURF_TYPE_TO_IDX = {t: i for i, t in enumerate(SURF_TYPES)}
-
-
-def detect_surfactant(smiles: str):
-    """Detect head group, tail (= 4 carbon chain), and surfactant type.
-
-    Returns:
-        atom_mask_head: ndarray (N_atoms,) bool
-        atom_mask_tail: ndarray (N_atoms,) bool
-        surfactant_type: str
-    """
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        return np.zeros(len(smiles), dtype=bool), np.zeros(len(smiles), dtype=bool), SURF_TYPE_NONIONIC
-
-    n_atoms = mol.GetNumAtoms()
-    head_mask = np.zeros(n_atoms, dtype=bool)
-    tail_mask = np.zeros(n_atoms, dtype=bool)
-
-    counterion_patts = {
-        'Na': Chem.MolFromSmarts('[Na+]'), 'Li': Chem.MolFromSmarts('[Li+]'),
-        'K': Chem.MolFromSmarts('[K+]'), 'Cl': Chem.MolFromSmarts('[Cl-]'),
-        'Br': Chem.MolFromSmarts('[Br-]'), 'I': Chem.MolFromSmarts('[I-]'),
-    }
-    counterion_atoms = set()
-    for patt in counterion_patts.values():
-        if patt:
-            for m in mol.GetSubstructMatches(patt):
-                counterion_atoms.update(m)
-
-    anionic_patts = [
-        ('sulfonate', 'S(=O)(=O)[O-]'), ('sulfate', 'OS(=O)(=O)[O-]'),
-        ('carboxylate', 'C(=O)[O-]'), ('phosphate', 'OP(=O)([O-])[O-]'),
-    ]
-    cationic_patts = [
-        ('quat_ammonium', '[N+](C)(C)C'), ('ammonium', '[NH3+]'),
-        ('pyridinium', '[n+]1ccccc1'), ('imidazolium', '[n+]1cncc1'),
-    ]
-    nonionic_patts = [
-        ('hydroxyl', '[OH]'), ('ether', 'COC'), ('polyoxyethylene', 'CCOCCO'),
-        ('amide', 'NC(=O)'), ('ester', 'C(=O)OC'),
-    ]
-
-    has_anionic = mol.HasSubstructMatch(Chem.MolFromSmarts('[O-]')) or \
-                  mol.HasSubstructMatch(Chem.MolFromSmarts('[S-]'))
-    has_cationic = mol.HasSubstructMatch(Chem.MolFromSmarts('[N+]')) or \
-                   mol.HasSubstructMatch(Chem.MolFromSmarts('[n+]'))
-
-    if has_anionic and has_cationic:
-        surf_type = SURF_TYPE_ZWITTERIONIC
-    elif has_anionic:
-        surf_type = SURF_TYPE_ANIONIC
-    elif has_cationic:
-        surf_type = SURF_TYPE_CATIONIC
-    else:
-        surf_type = SURF_TYPE_NONIONIC
-
-    detectors = {'anionic': anionic_patts, 'cationic': cationic_patts,
-                 'nonionic': nonionic_patts}
-    if surf_type == SURF_TYPE_ZWITTERIONIC:
-        all_patts = anionic_patts + cationic_patts
-    else:
-        all_patts = detectors.get(surf_type, nonionic_patts)
-
-    for name, sma in all_patts:
-        patt = Chem.MolFromSmarts(sma)
-        if patt:
-            for m in mol.GetSubstructMatches(patt):
-                for idx in m:
-                    if idx not in counterion_atoms:
-                        head_mask[idx] = True
-
-    adj = defaultdict(list)
-    for bond in mol.GetBonds():
-        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
-        adj[i].append(j)
-        adj[j].append(i)
-
-    def dfs_longest(start, visited, chain):
-        best = chain[:]
-        for nb in adj[start]:
-            if nb in visited:
-                continue
-            if mol.GetAtomWithIdx(nb).GetAtomicNum() == 6 and nb not in counterion_atoms:
-                visited.add(nb)
-                result = dfs_longest(nb, visited, chain + [nb])
-                if len(result) > len(best):
-                    best = result
-                visited.remove(nb)
-        return best
-
-    carbons = [a.GetIdx() for a in mol.GetAtoms()
-               if a.GetAtomicNum() == 6 and a.GetIdx() not in counterion_atoms]
-    best_tail = []
-    for c in carbons:
-        visited = {c}
-        chain = dfs_longest(c, visited, [c])
-        if len(chain) > len(best_tail):
-            best_tail = chain
-
-    if len(best_tail) >= 4:
-        for idx in best_tail:
-            tail_mask[idx] = True
-    else:
-        for a in mol.GetAtoms():
-            idx = a.GetIdx()
-            if a.GetAtomicNum() == 6 and not head_mask[idx] and idx not in counterion_atoms:
-                tail_mask[idx] = True
-
-    for idx in counterion_atoms:
-        head_mask[idx] = False
-        tail_mask[idx] = False
-
-    return head_mask, tail_mask, surf_type
-
-
-# ===========================================================================
-# 4. Feature Vector Construction — per molecule (XGBoost input)
-# ===========================================================================
-
-def build_feature_vector(smiles: str) -> np.ndarray:
-    """Construct a fixed-length feature vector for one molecule.
-
-    Combines:
-      - Aggregated atom features (mean/std/min/max of 55-dim) → 220
-      - Aggregated bond features (mean/std/min/max of 14-dim) → 56
-      - Pharmacophore MACCS keys                           → 194
-      - BRICS reaction features                            → 34
-      - Surfactant type one-hot                            → 4
-      - Head/tail atom ratios                              → 2
-      - Basic molecular descriptors                        → 12
-      ----------------------------------------------------------
-      Total: 522 features
-
-    Returns None if SMILES is invalid.
-    """
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        return None
-
-    try:
-        AllChem.ComputeGasteigerCharges(mol)
-    except Exception:
-        pass
-
-    n_atoms = mol.GetNumAtoms()
-
-    # ---- 1. Atom-level aggregated features (55-dim → 220) ----
-    atom_feats = np.array([get_atom_features(a) for a in mol.GetAtoms()], dtype=np.float32)
-    if n_atoms > 0:
-        atom_agg = np.concatenate([
-            atom_feats.mean(axis=0),   # 55
-            atom_feats.std(axis=0),    # 55
-            atom_feats.min(axis=0),    # 55
-            atom_feats.max(axis=0),    # 55
-        ])  # 220
-    else:
-        atom_agg = np.zeros(ATOM_FEAT_DIM * 4, dtype=np.float32)
-
-    # ---- 2. Bond-level aggregated features (14-dim → 56) ----
-    bond_feats_list = [get_bond_features(b) for b in mol.GetBonds()]
-    if bond_feats_list:
-        bond_feats = np.array(bond_feats_list, dtype=np.float32)
-        bond_agg = np.concatenate([
-            bond_feats.mean(axis=0),
-            bond_feats.std(axis=0),
-            bond_feats.min(axis=0),
-            bond_feats.max(axis=0),
-        ])  # 56
-    else:
-        bond_agg = np.zeros(BOND_FEAT_DIM * 4, dtype=np.float32)
-
-    # ---- 3. Pharmacophore features (194) ----
-    pharm_feats = get_pharmacophore_features(mol)
-
-    # ---- 4. Reaction / BRICS features (34) ----
-    react_feats = get_reaction_features(mol)
-
-    # ---- 5. Surfactant features (4 + 2) ----
-    head_mask, tail_mask, surf_type = detect_surfactant(smiles)
-    surf_onehot = np.zeros(4, dtype=np.float32)
-    surf_onehot[SURF_TYPE_TO_IDX.get(surf_type, 2)] = 1.0
-    n_head = head_mask.sum() / max(n_atoms, 1)
-    n_tail = tail_mask.sum() / max(n_atoms, 1)
-
-    # ---- 6. Basic molecular descriptors (12) ----
-    mol_wt = Descriptors.MolWt(mol) / 500.0
-    logp = Descriptors.MolLogP(mol) / 10.0
-    tpsa = Descriptors.TPSA(mol) / 200.0
-    n_rot = Descriptors.NumRotatableBonds(mol) / max(n_atoms, 1)
-    n_hba = Descriptors.NumHAcceptors(mol) / max(n_atoms, 1)
-    n_hbd = Descriptors.NumHDonors(mol) / max(n_atoms, 1)
-    n_rings = rdMolDescriptors.CalcNumRings(mol) / 20.0
-    n_aro = rdMolDescriptors.CalcNumAromaticRings(mol) / 10.0
-    n_ali = rdMolDescriptors.CalcNumAliphaticRings(mol) / 10.0
-    frac_sp3 = rdMolDescriptors.CalcFractionCSP3(mol)
-    heavy_atoms = mol.GetNumHeavyAtoms() / 100.0
-    n_atoms_norm = n_atoms / 200.0
-
-    desc_feats = np.array([
-        mol_wt, logp, tpsa, n_rot, n_hba, n_hbd, n_rings, n_aro, n_ali,
-        frac_sp3, heavy_atoms, n_atoms_norm,
-    ], dtype=np.float32)
-
-    # ---- Concatenate all ----
-    feature_vector = np.concatenate([
-        atom_agg,       # 220
-        bond_agg,       # 56
-        pharm_feats,    # 194
-        react_feats,    # 34
-        surf_onehot,    # 4
-        [n_head, n_tail],  # 2
-        desc_feats,     # 12
-    ])
-
-    return feature_vector  # 522-dim
-
-
-# ===========================================================================
-# 5. Main — Load Data, Featurize, Train XGBoost with Optuna
+# Main - Load Data, Train XGBoost with Optuna
 # ===========================================================================
 
 def main():
@@ -461,9 +43,11 @@ def main():
     TARGET_COL = 'pCMC'
     SMILES_COL = 'SMILES'
     VAL_FRAC = 0.125
+    HOLDOUT_FRAC = 0.10           # holdout 用于从 Top-K 候选参数中二次筛选
     SEED = 42
-    N_OPTUNA_TRIALS = 50
+    N_OPTUNA_TRIALS = 200          # 增加搜索量以覆盖更多参数组合
     N_FOLDS = 5
+    TOP_K_CANDIDATES = 5           # 从 Top-K 中选泛化最好的
 
     random.seed(SEED)
     np.random.seed(SEED)
@@ -472,53 +56,23 @@ def main():
     print("XGBoost + PharmHGT-style Featurization for LogCMC (pCMC) Prediction")
     print("=" * 60)
 
-    # ---- Load data ----
-    df_train = pd.read_csv(DATA_TRAIN).dropna(subset=[TARGET_COL])
-    df_test = pd.read_csv(DATA_TEST).dropna(subset=[TARGET_COL])
-    print(f"Train rows: {len(df_train)}, Test rows: {len(df_test)}")
-
-    # ---- Featurize ----
-    print("\nFeaturizing training set...")
-    train_vecs, train_idx = [], []
-    n_total = len(df_train)
-    for i, smi in enumerate(df_train[SMILES_COL]):
-        if i % 100 == 0 and i > 0:
-            print(f"    ... {i}/{n_total} ({100*i//n_total}%)")
-        vec = build_feature_vector(smi)
-        if vec is not None:
-            train_vecs.append(vec)
-            train_idx.append(i)
-
-    X_full = np.array(train_vecs, dtype=np.float32)
-    y_full = df_train[TARGET_COL].values[train_idx]
+    # ---- Load / featurize (cached) ----
+    X_full, y_full, X_test, y_test = load_or_compute_features(
+        train_csv=DATA_TRAIN, test_csv=DATA_TEST,
+        target_col=TARGET_COL, smiles_col=SMILES_COL,
+    )
     print(f"  Train features: {X_full.shape}")
-
-    print("Featurizing test set...")
-    test_vecs, test_idx = [], []
-    n_test = len(df_test)
-    for i, smi in enumerate(df_test[SMILES_COL]):
-        if i % 50 == 0 and i > 0:
-            print(f"    ... {i}/{n_test} ({100*i//n_test}%)")
-        vec = build_feature_vector(smi)
-        if vec is not None:
-            test_vecs.append(vec)
-            test_idx.append(i)
-
-    X_test = np.array(test_vecs, dtype=np.float32)
-    y_test = df_test[TARGET_COL].values[test_idx]
     print(f"  Test features:  {X_test.shape}")
-
-    # Check for NaN/Inf
-    if np.any(np.isnan(X_full)) or np.any(np.isinf(X_full)):
-        print("  [WARNING] NaN/Inf in train features — replacing with 0")
-        X_full = np.nan_to_num(X_full, nan=0.0, posinf=0.0, neginf=0.0)
-    if np.any(np.isnan(X_test)) or np.any(np.isinf(X_test)):
-        X_test = np.nan_to_num(X_test, nan=0.0, posinf=0.0, neginf=0.0)
 
     # ---- Train/Validation split ----
     X_train, X_val, y_train, y_val = train_test_split(
         X_full, y_full, test_size=VAL_FRAC, random_state=SEED)
     print(f"\nSplit: Train {len(X_train)}, Val {len(X_val)}, Test {len(X_test)}")
+
+    # ---- Holdout split (从训练数据中划出部分，用于 Optuna 后 Top-K 筛选) ----
+    X_cv, X_holdout, y_cv, y_holdout = train_test_split(
+        X_full, y_full, test_size=HOLDOUT_FRAC, random_state=SEED + 1)
+    print(f"  CV (Optuna): {len(X_cv)}, Holdout (Top-K filter): {len(X_holdout)}")
 
     # ======================================================================
     # Optuna Hyperparameter Optimization (K-Fold CV)
@@ -531,40 +85,37 @@ def main():
 
     def objective(trial):
         params = {
-            'n_estimators': trial.suggest_int('n_estimators', 500, 3000),
-            'max_depth': trial.suggest_int('max_depth', 3, 15),
-            'learning_rate': trial.suggest_float('learning_rate', 0.005, 0.3, log=True),
-            'subsample': trial.suggest_float('subsample', 0.5, 1.0),
-            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.3, 1.0),
-            'colsample_bylevel': trial.suggest_float('colsample_bylevel', 0.3, 1.0),
-            'colsample_bynode': trial.suggest_float('colsample_bynode', 0.3, 1.0),
-            'min_child_weight': trial.suggest_float('min_child_weight', 1.0, 50.0, log=True),
-            'gamma': trial.suggest_float('gamma', 0.0, 5.0),
-            'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 10.0, log=True),
-            'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True),
-            'max_delta_step': trial.suggest_float('max_delta_step', 0.0, 10.0),
-            'verbosity': 0,
-            'objective': 'reg:squarederror',
-            'seed': SEED,
+            # Core parameters — 精炼范围
+            "n_estimators": trial.suggest_int("n_estimators", 800, 3000),
+            "max_depth": trial.suggest_int("max_depth", 4, 12),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+            # Regularization
+            "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.3, 1.0),
+            "colsample_bylevel": trial.suggest_float("colsample_bylevel", 0.3, 1.0),
+            "colsample_bynode": trial.suggest_float("colsample_bynode", 0.3, 1.0),
+            "min_child_weight": trial.suggest_float("min_child_weight", 1.0, 30.0, log=True),
+            "gamma": trial.suggest_float("gamma", 0.0, 2.0),
+            "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
+            "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
+            "max_delta_step": trial.suggest_float("max_delta_step", 0.0, 8.0),
+            "booster": trial.suggest_categorical("booster", ["gbtree", "dart"]),
         }
-
-        # Booster type
-        booster = trial.suggest_categorical('booster', ['gbtree', 'dart'])
-        params['booster'] = booster
-        if booster == 'dart':
-            params['rate_drop'] = trial.suggest_float('rate_drop', 0.01, 0.3)
-            params['skip_drop'] = trial.suggest_float('skip_drop', 0.01, 0.3)
-            params['one_drop'] = trial.suggest_categorical('one_drop', [0, 1])
 
         cv_scores = []
         kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
-        for train_idx_cv, val_idx_cv in kf.split(X_full):
-            X_tr_cv = X_full[train_idx_cv]
-            y_tr_cv = y_full[train_idx_cv]
-            X_val_cv = X_full[val_idx_cv]
-            y_val_cv = y_full[val_idx_cv]
+        for fold, (train_idx_cv, val_idx_cv) in enumerate(kf.split(X_cv)):
+            X_tr_cv = X_cv[train_idx_cv]
+            y_tr_cv = y_cv[train_idx_cv]
+            X_val_cv = X_cv[val_idx_cv]
+            y_val_cv = y_cv[val_idx_cv]
 
-            model_cv = xgb.XGBRegressor(**params, n_jobs=-1)
+            model_cv = xgb.XGBRegressor(
+                random_state=SEED,
+                verbosity=0,
+                early_stopping_rounds=100,
+                **params,
+            )
             model_cv.fit(
                 X_tr_cv, y_tr_cv,
                 eval_set=[(X_val_cv, y_val_cv)],
@@ -572,12 +123,25 @@ def main():
             )
             y_pred_cv = model_cv.predict(X_val_cv)
             rmse_cv = np.sqrt(mean_squared_error(y_val_cv, y_pred_cv))
-            cv_scores.append(rmse_cv)
+
+            # ---- 计算训练-验证差距，惩罚过拟合 ----
+            y_train_pred_cv = model_cv.predict(X_tr_cv)
+            rmse_train_cv = np.sqrt(mean_squared_error(y_tr_cv, y_train_pred_cv))
+            gap = rmse_train_cv - rmse_cv
+            # 如果 gap > 0.3 说明明显过拟合，轻微调高 score
+            adjusted_rmse = rmse_cv * (1.0 + 0.05 * max(0.0, gap - 0.3))
+            cv_scores.append(adjusted_rmse)
+
+            # Report intermediate mean to pruner after each fold
+            mean_so_far = np.mean(cv_scores)
+            trial.report(mean_so_far, fold)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
 
         return np.mean(cv_scores)
 
-    sampler = optuna.samplers.TPESampler(seed=SEED)
-    pruner = MedianPruner(n_startup_trials=5, n_warmup_steps=10, interval_steps=1)
+    sampler = optuna.samplers.TPESampler(multivariate=True, seed=SEED, n_startup_trials=10)
+    pruner = MedianPruner(n_startup_trials=5, n_warmup_steps=1, n_min_trials=3)
     study = optuna.create_study(
         study_name=f'xgboost_{FEATURE_NAME}',
         direction='minimize',
@@ -586,30 +150,93 @@ def main():
     )
     study.optimize(objective, n_trials=N_OPTUNA_TRIALS, show_progress_bar=True)
 
+    # ---- Print all trial CV results ----
+    print("\n" + "-" * 60)
+    print("All Trial CV Results:")
+    print(f"{'Trial':>5} {'Mean RMSE':>10} {'Std RMSE':>9}  {'CV Scores'}")
+    print("-" * 60)
+    for t in study.trials:
+        if t.values is not None:
+            print(f"{t.number:>5} {t.values[0]:>10.4f}")
+    print("-" * 60)
+
     print(f"\n=== Best Trial ===")
     print(f"  CV RMSE: {study.best_value:.6f}")
     print(f"  Params:  {study.best_params}")
 
+    # ---- Parameter importance ----
+    try:
+        importances = optuna.importance.get_param_importances(study)
+        print(f"\nParameter Importance:")
+        for param, imp in importances.items():
+            print(f"  {param}: {imp:.4f}")
+    except Exception:
+        pass
+
     # ======================================================================
-    # Final Training with Best Params
+    # Top-K Holdout Validation — 从最佳参数中选泛化最好的
     # ======================================================================
     print("\n" + "=" * 60)
-    print("Training Final Model with Best Hyperparameters")
+    print(f"Top-{TOP_K_CANDIDATES} Holdout Validation — selecting most generalizable params")
     print("=" * 60)
 
-    best_params = study.best_params
-    best_params['verbosity'] = 0
-    best_params['objective'] = 'reg:squarederror'
-    best_params['seed'] = SEED
-    # Remove DART-specific params if final booster is gbtree
-    if best_params.get('booster') != 'dart':
-        for dart_key in ['rate_drop', 'skip_drop', 'one_drop']:
-            best_params.pop(dart_key, None)
+    # 按 CV RMSE 排序，取前 TOP_K_CANDIDATES 个 trial
+    sorted_trials = sorted(
+        [t for t in study.trials if t.values is not None],
+        key=lambda t: t.values[0]
+    )
+    top_k = sorted_trials[:TOP_K_CANDIDATES]
 
-    final_model = xgb.XGBRegressor(**best_params, n_jobs=-1)
+    best_holdout_rmse = float('inf')
+    best_holdout_params = None
+
+    print(f"{'Rank':>5} {'CV RMSE':>10} {'Holdout RMSE':>14} {'Holdout R²':>12}")
+    print("-" * 60)
+    for rank, t in enumerate(top_k):
+        params = t.params
+        # 在 holdout 集上评估
+        model_tmp = xgb.XGBRegressor(
+            random_state=SEED, verbosity=0,
+            early_stopping_rounds=150,
+            **params,
+        )
+        model_tmp.fit(
+            X_cv, y_cv,
+            eval_set=[(X_cv, y_cv)],
+            verbose=False,
+        )
+        y_pred_ho = model_tmp.predict(X_holdout)
+        ho_rmse = np.sqrt(mean_squared_error(y_holdout, y_pred_ho))
+        ho_r2 = r2_score(y_holdout, y_pred_ho)
+        print(f"{rank+1:>5} {t.values[0]:>10.4f} {ho_rmse:>14.4f} {ho_r2:>12.4f}")
+        if ho_rmse < best_holdout_rmse:
+            best_holdout_rmse = ho_rmse
+            best_holdout_params = params
+
+    print(f"\n  → Selected params (holdout RMSE={best_holdout_rmse:.4f}):")
+    for k, v in best_holdout_params.items():
+        print(f"    {k}: {v}")
+
+    # ======================================================================
+    # Final Training with Best Params — 使用全部数据
+    # ======================================================================
+    print("\n" + "=" * 60)
+    print(f"Training Final Model with Best Hyperparameters (X_full: {len(X_full)} samples)")
+    print("=" * 60)
+
+    best_params = best_holdout_params.copy()
+
+    # 确保用于最终训练的 n_estimators 足够大 (>= 3000)
+    # 这样模型可以充分收敛 (early_stopping_rounds 控制早停)
+    best_params["n_estimators"] = max(best_params.get("n_estimators", 1000), 3000)
+
+    final_model = xgb.XGBRegressor(
+        random_state=SEED,
+        verbosity=0,
+        **best_params,
+    )
     final_model.fit(
         X_full, y_full,
-        eval_set=[(X_val, y_val)],
         verbose=False,
     )
 
@@ -629,39 +256,19 @@ def main():
     print(f"  Test MSE:  {test_mse:.4f}")
     print(f"  Test RMSE: {test_rmse:.4f}")
     print(f"  Test MAE:  {test_mae:.4f}")
-    print(f"  Test R²:   {test_r2:.4f}")
+    print(f"  Test R虏:   {test_r2:.4f}")
 
     # ---- Feature Importance ----
     print(f"\n{'='*60}")
-    print("Top 20 Feature Importances (weight)")
+    print("Top 20 Feature Importances")
     print(f"{'='*60}")
     importances = final_model.feature_importances_
     top_idx = np.argsort(importances)[::-1][:20]
-    # Build feature names (same layout as build_feature_vector)
-    names = []
-    for i in range(220):
-        group = i // 55
-        dim = i % 55
-        prefix = ['atom_mean', 'atom_std', 'atom_min', 'atom_max'][group]
-        names.append(f'{prefix}_{dim}')
-    for i in range(56):
-        group = i // 14
-        dim = i % 14
-        prefix = ['bond_mean', 'bond_std', 'bond_min', 'bond_max'][group]
-        names.append(f'{prefix}_{dim}')
-    for i in range(194):
-        names.append(f'maccs_{i}')
-    for i in range(34):
-        names.append(f'brics_{i}')
-    names.extend(['surf_anionic', 'surf_cationic', 'surf_nonionic', 'surf_zwitterionic'])
-    names.extend(['head_ratio', 'tail_ratio'])
-    names.extend([
-        'MolWt', 'LogP', 'TPSA', 'RotBonds', 'HBA', 'HBD',
-        'NumRings', 'AroRings', 'AliRings', 'FracSP3', 'HeavyAtoms', 'NAtoms',
-    ])
+
+    names = FEATURE_NAMES  # from smiles_to_features_pharmhgt
 
     for rank, idx in enumerate(top_idx):
-        print(f"  {rank+1:2d}. {names[idx]:25s}  {importances[idx]:.4f}")
+        print(f"  {rank+1:2d}. {names[idx]:25s}  {importances[idx]:.1f}")
 
     # ---- Save predictions plot ----
     try:
@@ -671,7 +278,7 @@ def main():
         import seaborn as sns
 
         fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-        fig.suptitle('XGBoost + PharmHGT Features — pCMC Prediction', fontsize=14)
+        fig.suptitle('XGBoost + PharmHGT Features - pCMC Prediction', fontsize=14)
 
         # Pred vs True
         ax = axes[0]
@@ -680,7 +287,7 @@ def main():
         ax.plot(lims, lims, 'r--', alpha=0.8, linewidth=1)
         ax.set_xlim(lims); ax.set_ylim(lims)
         ax.set_xlabel('True pCMC'); ax.set_ylabel('Predicted pCMC')
-        ax.set_title(f'Test R² = {test_r2:.4f}')
+        ax.set_title(f'Test R虏 = {test_r2:.4f}')
         ax.axis('square')
 
         # Residuals
@@ -697,26 +304,30 @@ def main():
         plt.savefig(plot_path, dpi=150, bbox_inches='tight')
         print(f"\nPlot saved to {plot_path}")
     except ImportError:
-        print("\n(Matplotlib not available — skipping plot)")
+        print("\n(Matplotlib not available - skipping plot)")
 
     # ---- Save model ----
     import joblib
     model_path = 'xgboost_pharmhgt_model.pkl'
+    # XGBoost has its own save/load, but we store the sklearn-compatible wrapper
     joblib.dump(final_model, model_path)
     print(f"Model saved to {model_path}")
 
     print(f"\n{'='*60}")
-    print("SUMMARY — XGBoost + PharmHGT Features")
+    print("SUMMARY - XGBoost + PharmHGT Features")
     print(f"{'='*60}")
     print(f"  Features:  {X_full.shape[1]}-dim (atom_agg + bond_agg + MACCS + BRICS + surfactant + descriptors)")
-    print(f"  Train:     {len(X_full)} (split {len(X_train)} train + {len(X_val)} val)")
+    print(f"  Train:     {len(X_full)} (CV {len(X_cv)} + Holdout {len(X_holdout)})")
     print(f"  Test:      {len(X_test)}")
-    print(f"  Optuna:    {N_OPTUNA_TRIALS} trials, {N_FOLDS}-fold CV")
+    print(f"  Optuna:    {N_OPTUNA_TRIALS} trials, {N_FOLDS}-fold CV, multivariate TPE, gap penalty")
+    print(f"  Top-K:     {TOP_K_CANDIDATES} candidates re-evaluated on holdout ({len(X_holdout)} samples)")
     print(f"  Best CV RMSE: {study.best_value:.4f}")
+    print(f"  Holdout RMSE: {best_holdout_rmse:.4f}")
     print(f"  Test RMSE: {test_rmse:.4f}")
     print(f"  Test MAE:  {test_mae:.4f}")
-    print(f"  Test R²:   {test_r2:.4f}")
+    print(f"  Test R虏:   {test_r2:.4f}")
 
 
 if __name__ == '__main__':
     main()
+

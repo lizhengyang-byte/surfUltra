@@ -27,9 +27,15 @@ Data expected at:
   ./data/surfpro_test.csv     (test, columns: SMILES, type, pCMC, ...)
 """
 
-import os, sys, math, random, warnings, hashlib
+import os, sys, math, random, warnings
 from copy import deepcopy
-from collections import defaultdict
+
+# Import featurization functions from shared module
+from smiles_to_features_pharmhgt import (
+    get_atom_features, get_bond_features,
+    get_pharmacophore_features, get_reaction_features,
+    detect_surfactant,
+)
 
 # Suppress RDKit warnings immediately
 from rdkit import RDLogger
@@ -40,10 +46,7 @@ import pandas as pd
 
 # RDKit
 from rdkit import Chem
-from rdkit.Chem import (
-    rdMolDescriptors, Descriptors, AllChem, MACCSkeys, BRICS, Crippen, rdchem
-)
-from rdkit.Chem.rdchem import BondType as BT, HybridizationType
+from rdkit.Chem import Descriptors, AllChem
 
 # PyTorch
 import torch
@@ -83,309 +86,13 @@ BOND_FEAT_DIM = 14
 PHARM_FEAT_DIM = 194   # MACCS keys
 REACT_FEAT_DIM = 34    # BRICS bond types
 
-# ===========================================================================
-# 1. Feature Extraction — Atom-level (55-dim) & Bond-level (14-dim)
-# ===========================================================================
-
-_ATOM_TYPES = [1, 3, 5, 6, 7, 8, 9, 11, 14, 15, 16, 17, 19, 35, 53, 79]
-_ATOM_TYPE_TO_IDX = {at: i for i, at in enumerate(_ATOM_TYPES)}
-_NUM_ATOM_TYPES = len(_ATOM_TYPES)  # 16
-
-_HYBRIDIZATION_TYPES = [
-    HybridizationType.SP, HybridizationType.SP2, HybridizationType.SP3,
-    HybridizationType.SP3D, HybridizationType.SP3D2
-]
-_HYB_TO_IDX = {h: i for i, h in enumerate(_HYBRIDIZATION_TYPES)}
-
-
-def get_atom_features(atom: Chem.Atom) -> np.ndarray:
-    """55-dim atom feature vector.
-
-    [0:16]    Atom type one-hot (16 elements)
-    [16:22]   Degree one-hot (0-5+)
-    [22]      Formal charge (normalized [-2,2]→[-1,1])
-    [23:28]   Implicit Hs one-hot (0-4+)
-    [28:33]   Hybridization one-hot
-    [33]      Is aromatic
-    [34]      In ring
-    [35]      Mass / 100
-    [36]      Chiral center
-    [37]      Radical electrons / 2
-    [38:42]   Explicit valence one-hot (1-5+)
-    [42:46]   Ring size one-hot (3,4,5,6)
-    [46:50]   Gasteiger charge bins
-    [50]      Ring >= 7
-    [51]      N or O
-    [52]      H donor
-    [53]      H acceptor
-    [54]      Heavy neighbors / 4
-    """
-    feat = np.zeros(55, dtype=np.float32)
-    mol = atom.GetOwningMol()
-
-    atomic_num = atom.GetAtomicNum()
-    type_idx = _ATOM_TYPE_TO_IDX.get(atomic_num, len(_ATOM_TYPES) - 1)
-    feat[type_idx] = 1.0
-
-    deg = min(atom.GetDegree(), 5)
-    feat[16 + deg] = 1.0
-
-    fc = np.clip(atom.GetFormalCharge(), -2, 2) / 2.0
-    feat[22] = fc
-
-    imp_h = min(atom.GetTotalNumHs(includeNeighbors=False), 4)
-    feat[23 + imp_h] = 1.0
-
-    hyb = atom.GetHybridization()
-    feat[28 + _HYB_TO_IDX.get(hyb, 0)] = 1.0
-
-    feat[33] = 1.0 if atom.GetIsAromatic() else 0.0
-    feat[34] = 1.0 if atom.IsInRing() else 0.0
-    feat[35] = atom.GetMass() / 100.0
-
-    if atom.GetChiralTag() != Chem.rdchem.ChiralType.CHI_UNSPECIFIED:
-        feat[36] = 1.0
-
-    feat[37] = min(atom.GetNumRadicalElectrons(), 2) / 2.0
-
-    val = atom.GetExplicitValence()
-    if 1 <= val <= 4:
-        feat[37 + val] = 1.0
-    elif val >= 5:
-        feat[41] = 1.0
-
-    if atom.IsInRing():
-        for ring in mol.GetRingInfo().AtomRings():
-            if atom.GetIdx() in ring:
-                sz = len(ring)
-                if 3 <= sz <= 6:
-                    feat[41 + sz - 2] = 1.0
-                if sz >= 7:
-                    feat[50] = 1.0
-                break
-
-    try:
-        gc = float(atom.GetDoubleProp('_GasteigerCharge'))
-        if np.isfinite(gc):
-            gc = np.clip(gc, -1.0, 1.0)
-            feat[46 + min(int((gc + 1.0) / 0.5), 3)] = 1.0
-    except (KeyError, ValueError):
-        pass
-
-    feat[51] = 1.0 if atomic_num in (7, 8) else 0.0
-    if atomic_num in (7, 8) and atom.GetTotalNumHs() > 0:
-        feat[52] = 1.0
-    feat[53] = 1.0 if atomic_num in (7, 8) else 0.0
-    feat[54] = atom.GetDegree() / 4.0
-
-    return feat
-
-
-_BOND_TYPE_MAP = {
-    BT.SINGLE: 0, BT.DOUBLE: 1, BT.TRIPLE: 2, BT.AROMATIC: 3,
-}
-_BOND_STEREO_MAP = {
-    Chem.rdchem.BondStereo.STEREONONE: 0,
-    Chem.rdchem.BondStereo.STEREOANY: 1,
-    Chem.rdchem.BondStereo.STEREOZ: 2,
-    Chem.rdchem.BondStereo.STEREOE: 3,
-    Chem.rdchem.BondStereo.STEREOCIS: 4,
-    Chem.rdchem.BondStereo.STEREOTRANS: 5,
-}
-
-
-def get_bond_features(bond: Chem.Bond) -> np.ndarray:
-    """14-dim bond feature vector.
-
-    [0:4]   Bond type
-    [4]     Conjugated
-    [5]     In ring
-    [6:12]  Stereo
-    [12]    Aromatic
-    [13]    In ring
-    """
-    feat = np.zeros(14, dtype=np.float32)
-    feat[_BOND_TYPE_MAP.get(bond.GetBondType(), 0)] = 1.0
-    feat[4] = 1.0 if bond.GetIsConjugated() else 0.0
-    feat[5] = 1.0 if bond.IsInRing() else 0.0
-    feat[6 + _BOND_STEREO_MAP.get(bond.GetStereo(), 0)] = 1.0
-    feat[12] = 1.0 if bond.GetBondType() == BT.AROMATIC else 0.0
-    feat[13] = 1.0 if bond.IsInRing() else 0.0
-    return feat
-
-
-# ===========================================================================
-# 2. Pharmacophore & Reaction Features (Gβ)
-# ===========================================================================
-
-def get_pharmacophore_features(mol: Chem.Mol) -> np.ndarray:
-    """194-dim: MACCS keys padded to 194."""
-    feat = np.zeros(PHARM_FEAT_DIM, dtype=np.float32)
-    try:
-        maccs = MACCSkeys.GenMACCSKeys(mol)
-        bits = np.array(list(maccs.ToBitString()), dtype=np.float32)
-        n = min(len(bits), PHARM_FEAT_DIM)
-        feat[:n] = bits[:n]
-    except Exception:
-        pass
-    return feat
-
-
-def get_reaction_features(mol: Chem.Mol) -> np.ndarray:
-    """34-dim: BRICS fragment type histogram.
-
-    Falls back gracefully if BRICS decomposition fails or hangs.
-    """
-    feat = np.zeros(REACT_FEAT_DIM, dtype=np.float32)
-    try:
-        # Quick pre-check: molecule must have rotatable bonds for BRICS
-        n_rot = Descriptors.NumRotatableBonds(mol)
-        if n_rot < 1:
-            return feat
-        # BRICS decomposition
-        frags_gen = BRICS.BRICSDecompose(mol, returnMols=False)
-        frags = []
-        for i, f in enumerate(frags_gen):
-            if i >= 128:  # safety limit
-                break
-            frags.append(f)
-        if frags:
-            for f in frags:
-                feat[int(hashlib.md5(f.encode()).hexdigest(), 16) % REACT_FEAT_DIM] += 1.0
-            feat = feat / max(len(frags), 1)
-    except Exception:
-        pass
-    return feat
-
-
-# ===========================================================================
-# 3. Surfactant Detection (Section 2.1.2)
-# ===========================================================================
-
+# Surfactant type constants (used by build_molecule_data and model forward pass)
 SURF_TYPE_ANIONIC = 'anionic'
 SURF_TYPE_CATIONIC = 'cationic'
 SURF_TYPE_NONIONIC = 'nonionic'
 SURF_TYPE_ZWITTERIONIC = 'zwitterionic'
 SURF_TYPES = [SURF_TYPE_ANIONIC, SURF_TYPE_CATIONIC, SURF_TYPE_NONIONIC, SURF_TYPE_ZWITTERIONIC]
 SURF_TYPE_TO_IDX = {t: i for i, t in enumerate(SURF_TYPES)}
-
-
-def detect_surfactant(smiles: str):
-    """Detect head group, tail (≥4 carbon chain), and surfactant type.
-
-    Returns:
-        atom_mask_head: ndarray (N_atoms,) bool
-        atom_mask_tail: ndarray (N_atoms,) bool
-        surfactant_type: str
-    """
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        return np.zeros(len(smiles), dtype=bool), np.zeros(len(smiles), dtype=bool), SURF_TYPE_NONIONIC
-
-    n_atoms = mol.GetNumAtoms()
-    head_mask = np.zeros(n_atoms, dtype=bool)
-    tail_mask = np.zeros(n_atoms, dtype=bool)
-
-    # Counterions to exclude
-    counterion_patts = {
-        'Na': Chem.MolFromSmarts('[Na+]'), 'Li': Chem.MolFromSmarts('[Li+]'),
-        'K': Chem.MolFromSmarts('[K+]'), 'Cl': Chem.MolFromSmarts('[Cl-]'),
-        'Br': Chem.MolFromSmarts('[Br-]'), 'I': Chem.MolFromSmarts('[I-]'),
-    }
-    counterion_atoms = set()
-    for patt in counterion_patts.values():
-        if patt:
-            for m in mol.GetSubstructMatches(patt):
-                counterion_atoms.update(m)
-
-    # ---- Detectors ----
-    anionic_patts = [
-        ('sulfonate', 'S(=O)(=O)[O-]'), ('sulfate', 'OS(=O)(=O)[O-]'),
-        ('carboxylate', 'C(=O)[O-]'), ('phosphate', 'OP(=O)([O-])[O-]'),
-    ]
-    cationic_patts = [
-        ('quat_ammonium', '[N+](C)(C)C'), ('ammonium', '[NH3+]'),
-        ('pyridinium', '[n+]1ccccc1'), ('imidazolium', '[n+]1cncc1'),
-    ]
-    nonionic_patts = [
-        ('hydroxyl', '[OH]'), ('ether', 'COC'), ('polyoxyethylene', 'CCOCCO'),
-        ('amide', 'NC(=O)'), ('ester', 'C(=O)OC'),
-    ]
-
-    # Classify
-    has_anionic = mol.HasSubstructMatch(Chem.MolFromSmarts('[O-]')) or \
-                  mol.HasSubstructMatch(Chem.MolFromSmarts('[S-]'))
-    has_cationic = mol.HasSubstructMatch(Chem.MolFromSmarts('[N+]')) or \
-                   mol.HasSubstructMatch(Chem.MolFromSmarts('[n+]'))
-
-    if has_anionic and has_cationic:
-        surf_type = SURF_TYPE_ZWITTERIONIC
-    elif has_anionic:
-        surf_type = SURF_TYPE_ANIONIC
-    elif has_cationic:
-        surf_type = SURF_TYPE_CATIONIC
-    else:
-        surf_type = SURF_TYPE_NONIONIC
-
-    # Head mask
-    detectors = {'anionic': anionic_patts, 'cationic': cationic_patts,
-                 'nonionic': nonionic_patts}
-    if surf_type == SURF_TYPE_ZWITTERIONIC:
-        all_patts = anionic_patts + cationic_patts
-    else:
-        all_patts = detectors.get(surf_type, nonionic_patts)
-
-    for name, sma in all_patts:
-        patt = Chem.MolFromSmarts(sma)
-        if patt:
-            for m in mol.GetSubstructMatches(patt):
-                for idx in m:
-                    if idx not in counterion_atoms:
-                        head_mask[idx] = True
-
-    # ---- Tail: DFS for longest carbon chain >= 4 ----
-    adj = defaultdict(list)
-    for bond in mol.GetBonds():
-        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
-        adj[i].append(j)
-        adj[j].append(i)
-
-    def dfs_longest(start, visited, chain):
-        best = chain[:]
-        for nb in adj[start]:
-            if nb in visited:
-                continue
-            if mol.GetAtomWithIdx(nb).GetAtomicNum() == 6 and nb not in counterion_atoms:
-                visited.add(nb)
-                result = dfs_longest(nb, visited, chain + [nb])
-                if len(result) > len(best):
-                    best = result
-                visited.remove(nb)
-        return best
-
-    carbons = [a.GetIdx() for a in mol.GetAtoms()
-               if a.GetAtomicNum() == 6 and a.GetIdx() not in counterion_atoms]
-    best_tail = []
-    for c in carbons:
-        visited = {c}
-        chain = dfs_longest(c, visited, [c])
-        if len(chain) > len(best_tail):
-            best_tail = chain
-
-    if len(best_tail) >= 4:
-        for idx in best_tail:
-            tail_mask[idx] = True
-    else:
-        for a in mol.GetAtoms():
-            idx = a.GetIdx()
-            if a.GetAtomicNum() == 6 and not head_mask[idx] and idx not in counterion_atoms:
-                tail_mask[idx] = True
-
-    for idx in counterion_atoms:
-        head_mask[idx] = False
-        tail_mask[idx] = False
-
-    return head_mask, tail_mask, surf_type
 
 
 # ===========================================================================
@@ -885,6 +592,17 @@ def run_optuna(train_dataset, val_dataset, n_trials=30):
     print(f"\n=== Best trial ===")
     print(f"  Val MSE: {study.best_value:.6f}")
     print(f"  Params: {study.best_params}")
+
+    # Print parameter importance for post-hoc analysis
+    try:
+        importances = optuna.importance.get_param_importances(study)
+        if importances:
+            print(f"\nParameter Importance (fANOVA):")
+            for param, imp in sorted(importances.items(), key=lambda x: -x[1]):
+                print(f"  {param:20s}  {imp:.4f}")
+    except Exception:
+        pass
+
     return study.best_params
 
 
@@ -899,7 +617,7 @@ def main():
     SMILES_COL = 'SMILES'
     VAL_FRAC = 0.125
     SEED = 42
-    USE_OPTUNA = False       # set True to enable Optuna search
+    USE_OPTUNA = True       # enable Optuna hyperparameter search
     N_OPTUNA_TRIALS = 30
     BATCH_SIZE = 64
     EPOCHS = 200

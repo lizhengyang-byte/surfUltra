@@ -11,7 +11,7 @@ Usage:
     vec_209 = smiles_to_features_all("CCO")
 """
 
-import hashlib
+import zlib
 from collections import defaultdict
 
 import numpy as np
@@ -93,7 +93,7 @@ def get_atom_features(atom: Chem.Atom) -> np.ndarray:
 
     feat[37] = min(atom.GetNumRadicalElectrons(), 2) / 2.0
 
-    val = atom.GetExplicitValence()
+    val = atom.GetValence(Chem.rdchem.ValenceType.EXPLICIT)
     if 1 <= val <= 4:
         feat[37 + val] = 1.0
     elif val >= 5:
@@ -166,7 +166,7 @@ def get_reaction_features(mol: Chem.Mol) -> np.ndarray:
             frags.append(f)
         if frags:
             for f in frags:
-                feat[int(hashlib.md5(f.encode()).hexdigest(), 16) % REACT_FEAT_DIM] += 1.0
+                feat[zlib.crc32(f.encode()) % REACT_FEAT_DIM] += 1.0
             feat = feat / max(len(frags), 1)
     except Exception:
         pass
